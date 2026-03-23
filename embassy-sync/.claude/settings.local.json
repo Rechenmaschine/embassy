@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --lib context_service::loom_tests 2>&1)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --lib context_service::loom_tests)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --test loom -- --test-threads=1 2>&1)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --test loom)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --test loom --features loom)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --lib --release --features loom context_service::loom_tests)",
+      "Bash(kill 28222 28191 28188)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --lib context_service::loom_tests::loom_job_storage)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --lib context_service::loom_tests::loom_concurrent_running_flag)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_cross_thread_call)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_try_call_immediate -- --exact)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_initialized_flag_idempotent)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_heap_value_through_slot)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_cancel_after_submit)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_runner_restart_recovery)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_two_callers_one_runner)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests::loom_try_call_immediate_races_call)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib context_service::loom_tests)",
+      "Bash(pkill -f embassy_sync-760060ad3af3e7d3)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib 'context_service::loom_tests::loom_cancel_after_submit' -- --exact)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib 'context_service::loom_tests::loom_runner_restart_recovery' -- --exact)",
+      "Bash(timeout 60 bash -c 'RUSTFLAGS=\"\"--cfg loom\"\" cargo test --release --lib \"\"context_service::loom_tests::loom_two_callers_one_runner\"\" -- --exact 2>&1 | tail -5')",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(timeout 60 bash -c 'RUSTFLAGS=\"\"--cfg loom\"\" cargo test --release --lib \"\"context_service::loom_tests::loom_try_call_immediate_races_call\"\" -- --exact 2>&1 | tail -5')",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib 'context_service::loom_tests::loom_two_callers_one_runner' -- --exact)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test --release --lib 'context_service::loom_tests::loom_try_call_immediate_races_call' -- --exact)",
+      "Bash(grep -n \"impl.*Future\" src/*.rs src/**/*.rs)",
+      "Bash(grep -n \"fn poll.*Pin<&mut Self>\" src/**/*.rs)"
+    ]
+  }
+}

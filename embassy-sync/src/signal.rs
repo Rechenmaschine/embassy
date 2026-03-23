@@ -51,7 +51,16 @@ where
     M: RawMutex,
 {
     /// Create a new `Signal`.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            state: Mutex::new(Cell::new(State::None)),
+        }
+    }
+
+    /// Create a new `Signal`.
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(Cell::new(State::None)),
         }

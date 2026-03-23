@@ -80,7 +80,16 @@ impl<M: RawMutex, T: Clone, const CAP: usize, const SUBS: usize, const PUBS: usi
     PubSubChannel<M, T, CAP, SUBS, PUBS>
 {
     /// Create a new channel
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            inner: Mutex::const_new(M::INIT, RefCell::new(PubSubState::new())),
+        }
+    }
+
+    /// Create a new channel
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             inner: Mutex::const_new(M::INIT, RefCell::new(PubSubState::new())),
         }

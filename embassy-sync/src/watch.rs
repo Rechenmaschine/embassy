@@ -301,6 +301,7 @@ impl<M: RawMutex, T: Clone, const N: usize> WatchBehavior<T> for Watch<M, T, N> 
 
 impl<M: RawMutex, T: Clone, const N: usize> Watch<M, T, N> {
     /// Create a new `Watch` channel for `N` receivers.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
         Self {
             mutex: Mutex::new(RefCell::new(WatchState {
@@ -312,8 +313,35 @@ impl<M: RawMutex, T: Clone, const N: usize> Watch<M, T, N> {
         }
     }
 
+    /// Create a new `Watch` channel for `N` receivers.
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        Self {
+            mutex: Mutex::new(RefCell::new(WatchState {
+                data: None,
+                current_id: 0,
+                wakers: MultiWakerRegistration::new(),
+                receiver_count: 0,
+            })),
+        }
+    }
+
     /// Create a new `Watch` channel with default data.
+    #[cfg(not(loom))]
     pub const fn new_with(data: T) -> Self {
+        Self {
+            mutex: Mutex::new(RefCell::new(WatchState {
+                data: Some(data),
+                current_id: 0,
+                wakers: MultiWakerRegistration::new(),
+                receiver_count: 0,
+            })),
+        }
+    }
+
+    /// Create a new `Watch` channel with default data.
+    #[cfg(loom)]
+    pub fn new_with(data: T) -> Self {
         Self {
             mutex: Mutex::new(RefCell::new(WatchState {
                 data: Some(data),
@@ -783,7 +811,7 @@ impl<'a, T: Clone> DerefMut for DynAnonReceiver<'a, T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use futures_executor::block_on;
 

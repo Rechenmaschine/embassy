@@ -8,6 +8,8 @@
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
 
+pub(crate) mod loom_api;
+
 // internal use
 mod ring_buffer;
 
@@ -24,4 +26,5 @@ pub mod semaphore;
 pub mod signal;
 pub mod waitqueue;
 pub mod watch;
+pub mod context_service;
 pub mod zerocopy_channel;

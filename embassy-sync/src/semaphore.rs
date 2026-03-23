@@ -90,6 +90,7 @@ impl<M: RawMutex> Default for GreedySemaphore<M> {
 
 impl<M: RawMutex> GreedySemaphore<M> {
     /// Create a new `Semaphore`.
+    #[cfg(not(loom))]
     pub const fn new(permits: usize) -> Self {
         Self {
             state: Mutex::new(Cell::new(SemaphoreState {
@@ -99,8 +100,19 @@ impl<M: RawMutex> GreedySemaphore<M> {
         }
     }
 
+    /// Create a new `Semaphore`.
+    #[cfg(loom)]
+    pub fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(Cell::new(SemaphoreState {
+                permits,
+                waker: WakerRegistration::new(),
+            })),
+        }
+    }
+
     #[cfg(test)]
-    fn permits(&self) -> usize {
+    pub(crate) fn permits(&self) -> usize {
         self.state.lock(|cell| {
             let state = cell.replace(SemaphoreState::EMPTY);
             let permits = state.permits;
@@ -245,7 +257,15 @@ where
     M: RawMutex,
 {
     /// Create a new `FairSemaphore`.
+    #[cfg(not(loom))]
     pub const fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(RefCell::new(FairSemaphoreState::new(permits))),
+        }
+    }
+
+    #[cfg(loom)]
+    pub fn new(permits: usize) -> Self {
         Self {
             state: Mutex::new(RefCell::new(FairSemaphoreState::new(permits))),
         }

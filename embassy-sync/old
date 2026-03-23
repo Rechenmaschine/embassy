@@ -1,0 +1,91 @@
+//! A context service.
+//! Provide mutable access to a shared resource, by serializing access to it though a mutex.
+//!
+//! purpose; run blocking operations on a shared resource from a caller inside an async context,
+//! without blocking the async executor.
+
+use crate::blocking_mutex::Mutex as BlockingMutex;
+use crate::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+use crate::waitqueue::GenericAtomicWaker;
+use core::cell::RefCell;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/*
+
+let service = ContextService::new()
+
+// service thread
+thread::spawn(||{
+    service.run().await
+})
+
+// delegate function to run on service thread.
+// wait on result.
+let res = service.call(|a|{
+    a.block_on_something();
+    println!("ohno!");
+    12
+}).await;
+// returns 12.
+
+// delegate and forget about it.
+// what about lifetimes bro
+// what if no space available lol
+let res = service.try_call(|a|{
+    a.block_on_something();
+    println!("ohno!");
+})
+// reutrns whether res was scheduled to run?
+
+ */
+
+async fn main() {
+    struct Wrapper(u32);
+
+    let service: ContextService<NoopRawMutex, Wrapper> = ContextService {
+        _marker: Default::default(),
+    };
+
+    let y = service
+        .call(|x| {
+            x.0 += 1;
+            x.0
+        })
+        .await;
+}
+
+struct ContextService<M, T> {
+    _marker: PhantomData<(M, T)>,
+}
+
+impl<M, T> ContextService<M, T> {
+    // f where f(&mut M) -> R
+    fn call<R>(&'_ self, f: impl FnOnce(&mut T) -> R) -> JobFuture<'_, M, T, R> {
+        todo!()
+    }
+}
+
+struct JobFuture<'a, M, T, R> {
+    service: &'a ContextService<M, T>,
+    _phantom: PhantomData<(M, T, R)>,
+}
+
+impl<'a, M, T, R> Future for JobFuture<'a, M, T, R> {
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        todo!()
+    }
+}
+
+struct Request<Ctx> {
+    run: fn(&mut Ctx),
+}
+
+struct Call<Ctx> {
+    request: Request<Ctx>,
+    _ctx: PhantomData<fn(&mut Ctx)>,
+}

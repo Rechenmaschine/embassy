@@ -55,7 +55,21 @@ where
     M: RawMutex,
 {
     /// Create a new read-write lock with the given value.
+    #[cfg(not(loom))]
     pub const fn new(value: T) -> Self {
+        Self {
+            inner: UnsafeCell::new(value),
+            state: BlockingMutex::new(RefCell::new(State {
+                readers: 0,
+                writer: false,
+                waker: WakerRegistration::new(),
+            })),
+        }
+    }
+
+    /// Create a new read-write lock with the given value.
+    #[cfg(loom)]
+    pub fn new(value: T) -> Self {
         Self {
             inner: UnsafeCell::new(value),
             state: BlockingMutex::new(RefCell::new(State {

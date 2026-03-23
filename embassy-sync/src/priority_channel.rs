@@ -499,7 +499,24 @@ where
     /// // Declare a bounded channel of 3 u32s.
     /// let mut channel = PriorityChannel::<NoopRawMutex, u32, Max, 3>::new();
     /// ```
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            inner: Mutex::new(RefCell::new(ChannelState::new())),
+        }
+    }
+
+    /// Establish a new bounded channel. For example, to create one with a NoopMutex:
+    ///
+    /// ```
+    /// use embassy_sync::priority_channel::{PriorityChannel, Max};
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    ///
+    /// // Declare a bounded channel of 3 u32s.
+    /// let mut channel = PriorityChannel::<NoopRawMutex, u32, Max, 3>::new();
+    /// ```
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(RefCell::new(ChannelState::new())),
         }

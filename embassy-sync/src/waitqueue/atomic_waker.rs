@@ -14,7 +14,16 @@ pub struct GenericAtomicWaker<M: RawMutex> {
 
 impl<M: RawMutex> GenericAtomicWaker<M> {
     /// Create a new `AtomicWaker`.
+    #[cfg(not(loom))]
     pub const fn new(mutex: M) -> Self {
+        Self {
+            waker: Mutex::const_new(mutex, Cell::new(None)),
+        }
+    }
+
+    /// Create a new `AtomicWaker`.
+    #[cfg(loom)]
+    pub fn new(mutex: M) -> Self {
         Self {
             waker: Mutex::const_new(mutex, Cell::new(None)),
         }
@@ -48,7 +57,16 @@ pub struct AtomicWaker {
 
 impl AtomicWaker {
     /// Create a new `AtomicWaker`.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            waker: GenericAtomicWaker::new(CriticalSectionRawMutex::new()),
+        }
+    }
+
+    /// Create a new `AtomicWaker`.
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             waker: GenericAtomicWaker::new(CriticalSectionRawMutex::new()),
         }

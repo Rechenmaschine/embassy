@@ -26,6 +26,9 @@ src_base = "https://github.com/embassy-rs/embassy/blob/embassy-sync-v$VERSION/em
 src_base_git = "https://github.com/embassy-rs/embassy/blob/$COMMIT/embassy-sync/src/"
 target = "thumbv7em-none-eabi"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(feature, values("loom"))'] }
+
 [features]
 defmt = ["dep:defmt"]
 log = ["dep:log"]
@@ -42,6 +45,7 @@ critical-section = "1.1"
 heapless = "0.9"
 cfg-if = "1.0.0"
 embedded-io-async = { version = "0.7.0" }
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 futures-executor = { version = "0.3.17", features = [ "thread-pool" ] }
@@ -52,4 +56,5 @@ futures-util = { version = "0.3.17", features = [ "channel", "sink" ] }
 # Enable critical-section implementation for std, for tests
 critical-section = { version = "1.1", features = ["std"] }
 static_cell = { version = "2" }
+loom = "0.7"
 trybuild = "1.0.105"

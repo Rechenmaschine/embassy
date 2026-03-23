@@ -259,7 +259,29 @@ where
     /// // Declare a bounded pipe, with a buffer of 256 bytes.
     /// let mut pipe = Pipe::<NoopRawMutex, 256>::new();
     /// ```
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            buf: Buffer(UnsafeCell::new([0; N])),
+            inner: Mutex::new(RefCell::new(PipeState {
+                buffer: RingBuffer::new(),
+                read_waker: WakerRegistration::new(),
+                write_waker: WakerRegistration::new(),
+            })),
+        }
+    }
+
+    /// Establish a new bounded pipe. For example, to create one with a NoopMutex:
+    ///
+    /// ```
+    /// use embassy_sync::pipe::Pipe;
+    /// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    ///
+    /// // Declare a bounded pipe, with a buffer of 256 bytes.
+    /// let mut pipe = Pipe::<NoopRawMutex, 256>::new();
+    /// ```
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             buf: Buffer(UnsafeCell::new([0; N])),
             inner: Mutex::new(RefCell::new(PipeState {

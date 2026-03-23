@@ -149,3 +149,44 @@ mod thread_mode {
 }
 #[cfg(any(cortex_m, doc, feature = "std"))]
 pub use thread_mode::*;
+
+// ================
+
+#[cfg(loom)]
+mod loom_raw_mutex {
+    extern crate std;
+    use super::*;
+
+    /// A [`RawMutex`] backed by `loom::sync::Mutex` for use in loom tests.
+    ///
+    /// The inner loom mutex is lazily initialized on first `lock()` via
+    /// `std::sync::OnceLock` so that `INIT` can be a `const`.
+    pub struct LoomRawMutex {
+        inner: std::sync::OnceLock<loom::sync::Mutex<()>>,
+    }
+
+    unsafe impl Send for LoomRawMutex {}
+    unsafe impl Sync for LoomRawMutex {}
+
+    impl LoomRawMutex {
+        /// Create a new `LoomRawMutex`.
+        pub const fn new() -> Self {
+            Self {
+                inner: std::sync::OnceLock::new(),
+            }
+        }
+    }
+
+    unsafe impl RawMutex for LoomRawMutex {
+        const INIT: Self = Self::new();
+
+        fn lock<R>(&self, f: impl FnOnce() -> R) -> R {
+            let mtx = self.inner.get_or_init(|| loom::sync::Mutex::new(()));
+            let _guard = mtx.lock().unwrap();
+            f()
+        }
+    }
+}
+
+#[cfg(loom)]
+pub use loom_raw_mutex::*;

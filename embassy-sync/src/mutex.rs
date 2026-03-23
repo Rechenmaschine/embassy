@@ -55,7 +55,20 @@ where
     M: RawMutex,
 {
     /// Create a new mutex with the given value.
+    #[cfg(not(loom))]
     pub const fn new(value: T) -> Self {
+        Self {
+            inner: UnsafeCell::new(value),
+            state: BlockingMutex::new(RefCell::new(State {
+                locked: false,
+                waker: WakerRegistration::new(),
+            })),
+        }
+    }
+
+    /// Create a new mutex with the given value.
+    #[cfg(loom)]
+    pub fn new(value: T) -> Self {
         Self {
             inner: UnsafeCell::new(value),
             state: BlockingMutex::new(RefCell::new(State {

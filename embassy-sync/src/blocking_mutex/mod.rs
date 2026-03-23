@@ -3,7 +3,7 @@
 //! This module provides a blocking mutex that can be used to synchronize data.
 pub mod raw;
 
-use core::cell::UnsafeCell;
+use crate::loom_api::cell::UnsafeCell;
 
 use self::raw::RawMutex;
 
@@ -35,8 +35,19 @@ unsafe impl<R: RawMutex + Sync, T: ?Sized + Send> Sync for Mutex<R, T> {}
 
 impl<R: RawMutex, T> Mutex<R, T> {
     /// Creates a new mutex in an unlocked state ready for use.
+    #[cfg(not(loom))]
     #[inline]
     pub const fn new(val: T) -> Mutex<R, T> {
+        Mutex {
+            raw: R::INIT,
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    /// Creates a new mutex in an unlocked state ready for use.
+    #[cfg(loom)]
+    #[inline]
+    pub fn new(val: T) -> Mutex<R, T> {
         Mutex {
             raw: R::INIT,
             data: UnsafeCell::new(val),
@@ -46,9 +57,10 @@ impl<R: RawMutex, T> Mutex<R, T> {
     /// Creates a critical section and grants temporary access to the protected data.
     pub fn lock<U>(&self, f: impl FnOnce(&T) -> U) -> U {
         self.raw.lock(|| {
-            let ptr = self.data.get() as *const T;
-            let inner = unsafe { &*ptr };
-            f(inner)
+            self.data.with(|ptr| {
+                let inner = unsafe { &*ptr };
+                f(inner)
+            })
         })
     }
 
@@ -62,10 +74,11 @@ impl<R: RawMutex, T> Mutex<R, T> {
     /// mutable access that never causes UB, use a `RefCell` in a `Mutex`.
     pub unsafe fn lock_mut<U>(&self, f: impl FnOnce(&mut T) -> U) -> U {
         self.raw.lock(|| {
-            let ptr = self.data.get() as *mut T;
-            // Safety: we have exclusive access to the data, as long as this mutex is not locked re-entrantly
-            let inner = unsafe { &mut *ptr };
-            f(inner)
+            self.data.with_mut(|ptr| {
+                // Safety: we have exclusive access to the data, as long as this mutex is not locked re-entrantly
+                let inner = unsafe { &mut *ptr };
+                f(inner)
+            })
         })
     }
 }
@@ -74,8 +87,19 @@ impl<R, T> Mutex<R, T> {
     /// Creates a new mutex based on a pre-existing raw mutex.
     ///
     /// This allows creating a mutex in a constant context on stable Rust.
+    #[cfg(not(loom))]
     #[inline]
     pub const fn const_new(raw_mutex: R, val: T) -> Mutex<R, T> {
+        Mutex {
+            raw: raw_mutex,
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    /// Creates a new mutex based on a pre-existing raw mutex.
+    #[cfg(loom)]
+    #[inline]
+    pub fn const_new(raw_mutex: R, val: T) -> Mutex<R, T> {
         Mutex {
             raw: raw_mutex,
             data: UnsafeCell::new(val),
@@ -94,7 +118,7 @@ impl<R, T> Mutex<R, T> {
     /// take place---the mutable borrow statically guarantees no locks exist.
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.data.get() }
+        self.data.get_mut()
     }
 }
 
@@ -115,8 +139,7 @@ pub type NoopMutex<T> = Mutex<raw::NoopRawMutex, T>;
 impl<T> Mutex<raw::CriticalSectionRawMutex, T> {
     /// Borrows the data for the duration of the critical section
     pub fn borrow<'cs>(&'cs self, _cs: critical_section::CriticalSection<'cs>) -> &'cs T {
-        let ptr = self.data.get() as *const T;
-        unsafe { &*ptr }
+        self.data.with(|ptr| unsafe { &*ptr })
     }
 }
 
@@ -124,8 +147,7 @@ impl<T> Mutex<raw::NoopRawMutex, T> {
     /// Borrows the data
     #[allow(clippy::should_implement_trait)]
     pub fn borrow(&self) -> &T {
-        let ptr = self.data.get() as *const T;
-        unsafe { &*ptr }
+        self.data.with(|ptr| unsafe { &*ptr })
     }
 }
 
@@ -160,7 +182,16 @@ mod thread_mode_mutex {
 
     impl<T> ThreadModeMutex<T> {
         /// Creates a new mutex
+        #[cfg(not(loom))]
         pub const fn new(value: T) -> Self {
+            ThreadModeMutex {
+                inner: UnsafeCell::new(value),
+            }
+        }
+
+        /// Creates a new mutex
+        #[cfg(loom)]
+        pub fn new(value: T) -> Self {
             ThreadModeMutex {
                 inner: UnsafeCell::new(value),
             }
@@ -187,7 +218,7 @@ mod thread_mode_mutex {
                 raw::in_thread_mode(),
                 "ThreadModeMutex can only be borrowed from thread mode."
             );
-            unsafe { &*self.inner.get() }
+            self.inner.with(|ptr| unsafe { &*ptr })
         }
     }
 
