@@ -176,8 +176,9 @@ impl<const S: usize> Storage<S> {
     /// # Safety
     /// Slot must be empty. `size_of::<T>() <= S` and `align_of::<T>() <= align_of::<Self>()`.
     unsafe fn store<T>(&self, val: T) {
+        // SAFETY: caller guarantees the slot is empty and T fits.
         unsafe {
-            ((*self.buf.get()).as_mut_ptr() as *mut T).write(val);
+            (*self.buf.get()).as_mut_ptr().cast::<T>().write(val);
             *self.drop_fn.get() = Some(Self::drop_glue::<T>);
         }
     }
@@ -185,8 +186,9 @@ impl<const S: usize> Storage<S> {
     /// # Safety
     /// Slot must contain a live `T`.
     unsafe fn take<T>(&self) -> T {
+        // SAFETY: caller guarantees a live T is in the slot.
         unsafe {
-            let val = ((*self.buf.get()).as_ptr() as *const T).read();
+            let val = (*self.buf.get()).as_ptr().cast::<T>().read();
             *self.drop_fn.get() = None;
             val
         }
@@ -195,6 +197,7 @@ impl<const S: usize> Storage<S> {
     /// # Safety
     /// Caller must have exclusive access.
     unsafe fn drop_contents(&self) {
+        // SAFETY: caller guarantees exclusive access.
         unsafe {
             if let Some(f) = (*self.drop_fn.get()).take() {
                 f(self);
@@ -203,15 +206,16 @@ impl<const S: usize> Storage<S> {
     }
 
     unsafe fn drop_glue<T>(slot: &Self) {
+        // SAFETY: caller guarantees the slot contains a live T.
         unsafe {
-            core::ptr::drop_in_place((*slot.buf.get()).as_mut_ptr() as *mut T);
+            core::ptr::drop_in_place((*slot.buf.get()).as_mut_ptr().cast::<T>());
         }
     }
 }
 
 impl<const S: usize> Drop for Storage<S> {
     fn drop(&mut self) {
-        // Safety: &mut self guarantees exclusive access.
+        // SAFETY: &mut self guarantees exclusive access.
         unsafe { self.drop_contents() };
     }
 }
@@ -222,6 +226,7 @@ impl<const S: usize> Drop for Storage<S> {
 ///
 /// After return, slot contains a live `R`.
 unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &Storage<S>, state: &mut T) {
+    // SAFETY: caller guarantees slot contains a live F and R fits.
     unsafe {
         let f: F = slot.take();
         let res = f(state);
@@ -249,7 +254,7 @@ impl<M: RawMutex, T, const S: usize> Drop for SlotGuard<'_, M, T, S> {
     }
 }
 
-impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
+impl<M: RawMutex, T, const S: usize> SlotGuard<'_, M, T, S> {
     /// Store `f` in the slot and wake the runner.
     ///
     /// # Safety
@@ -257,6 +262,7 @@ impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
     unsafe fn submit<R, F: FnOnce(&mut T) -> R>(self, f: F) {
         let slot = self.slot;
         mem::forget(self);
+        // SAFETY: guard proves slot is acquired, caller guarantees F and R fit.
         unsafe { slot.storage.store(f) };
         slot.job.signal(run_job::<T, R, F, S>);
     }
@@ -269,6 +275,7 @@ impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
     unsafe fn submit_immediate<F: FnOnce(&mut T)>(self, f: F) {
         let slot = self.slot;
         mem::forget(self);
+        // SAFETY: guard proves slot is acquired, caller guarantees F fits.
         unsafe { slot.storage.store(f) };
         slot.ack.signal(());
         slot.job.signal(run_job::<T, (), F, S>);
@@ -334,7 +341,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(()) => {
                 self.debug_assert_held();
-                // Safety: slot contains a live R written by run_job.
+                // SAFETY: done was signaled, so the runner wrote R into the slot.
                 let result = unsafe { self.storage.take::<R>() };
                 self.ack.signal(());
                 Poll::Ready(result)
@@ -346,7 +353,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     async fn wait_ack_and_finish(&self) {
         self.ack.wait().await;
         self.debug_assert_held();
-        // Safety: ack received, exclusive slot access.
+        // SAFETY: ack received, so the caller is done with the slot.
         unsafe { self.storage.drop_contents() };
         self.done.reset();
         self.mark_free();
@@ -458,10 +465,6 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     /// in-flight state and resume processing. Callers that were blocked will
     /// transparently continue once the new runner starts.
     pub async fn run(&self, state: &mut T) -> ! {
-        if self.running.swap(true, Ordering::Acquire) {
-            panic!("ContextService::run() must not be called concurrently")
-        }
-
         struct RunGuard<'a> {
             running: &'a AtomicBool,
         }
@@ -469,6 +472,10 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
             fn drop(&mut self) {
                 self.running.store(false, Ordering::Release);
             }
+        }
+
+        if self.running.swap(true, Ordering::Acquire) {
+            panic!("ContextService::run() must not be called concurrently")
         }
         let _guard = RunGuard {
             running: &self.running,
@@ -498,7 +505,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
             // Mark in-flight so a subsequent run() knows to recover.
             self.needs_recovery.store(true, Ordering::Release);
 
-            // Safety: slot contains a live F, run_fn matches its types.
+            // SAFETY: slot contains a live F, run_fn matches its types.
             // No other task can access the slot: the caller is waiting on done.
             unsafe { run_fn(&self.slot.storage, state) };
             self.slot.done.signal(());
@@ -514,7 +521,8 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     }
 }
 
-// Safety: access is serialized by the call/run handshake protocol.
+// SAFETY: access to Storage is serialized by the call/run handshake protocol.
+// The remaining fields (signals, mutex, atomics) are Sync on their own.
 unsafe impl<M: RawMutex, T, const S: usize> Sync for ContextService<M, T, S>
 where
     Mutex<M, Cell<SlotState>>: Sync,
@@ -536,7 +544,7 @@ pub struct CallFuture<'a, M: RawMutex, T, R, F, const S: usize> {
 
 impl<M: RawMutex, T, R, F, const S: usize> Unpin for CallFuture<'_, M, T, R, F, S> {}
 
-impl<'a, M, T, R, F, const S: usize> Future for CallFuture<'a, M, T, R, F, S>
+impl<M, T, R, F, const S: usize> Future for CallFuture<'_, M, T, R, F, S>
 where
     M: RawMutex,
     F: FnOnce(&mut T) -> R + Send + 'static,
@@ -551,7 +559,7 @@ where
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(guard) => {
                         let f = self.f.take().unwrap();
-                        // Safety: F and R fit (compile-time check in call()).
+                        // SAFETY: F and R fit (compile-time check in call()).
                         unsafe { guard.submit::<R, F>(f) };
                         self.phase = Phase::Submitted;
                     }
@@ -977,7 +985,7 @@ mod tests {
     async fn cancel_after_submit_no_leak() {
         let drop_count = Arc::new(AtomicUsize::new(0));
 
-        struct Heavy(Arc<AtomicUsize>, [u8; 64]);
+        struct Heavy(Arc<AtomicUsize>, #[allow(dead_code)] [u8; 64]);
         impl Drop for Heavy {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::Relaxed);
