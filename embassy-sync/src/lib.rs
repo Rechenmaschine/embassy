@@ -25,6 +25,4 @@ pub mod signal;
 pub mod waitqueue;
 pub mod watch;
 pub mod zerocopy_channel;
-// mod context_service;
-// mod context_service_v2;
 pub mod context_service_v3;
