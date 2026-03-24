@@ -139,6 +139,20 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 // ack signal, no matter what gets dropped. CallFuture::drop sends ack if
 // the closure was already submitted. This guarantees the runner (or the
 // next runner, after recovery) can always make progress.
+//
+// Assumptions about Signal semantics (embassy_sync::signal::Signal):
+//   - signal(v) is sticky: if signaled before wait(), the value is not lost.
+//   - wait() consumes exactly one value: returns Ready once, then resets to None.
+//   - signal() overwrites any unconsumed value (single-slot, last-writer-wins).
+//   - signal()/wait() provide at least release/acquire synchronization:
+//     writes before signal() are visible after wait() returns.
+//   - wait() is cancel-safe: dropping the future does not consume the signal.
+//   - reset() clears any unconsumed value.
+//
+// Closures must not panic. Under panic=unwind, a panic in f(state) leaves
+// needs_recovery set and done unsignaled. The caller blocks until dropped,
+// at which point its Drop sends ack and the next runner can recover. This
+// is acceptable for embedded (panic=abort) but not robust under unwinding.
 
 struct SlotState {
     free: bool,
@@ -196,6 +210,11 @@ impl<const S: usize> Storage<S> {
 
     /// # Safety
     /// Caller must have exclusive access.
+    ///
+    /// # Panics
+    /// If the stored value's destructor panics, the slot is left in an
+    /// unspecified state. The `drop_fn` is already cleared, so double-drop
+    /// will not occur on the next call to `drop_contents`.
     unsafe fn drop_contents(&self) {
         // SAFETY: caller guarantees exclusive access.
         unsafe {
@@ -205,6 +224,8 @@ impl<const S: usize> Storage<S> {
         }
     }
 
+    /// # Safety
+    /// `slot` must currently contain a live `T`.
     unsafe fn drop_glue<T>(slot: &Self) {
         // SAFETY: caller guarantees the slot contains a live T.
         unsafe {
@@ -225,6 +246,11 @@ impl<const S: usize> Drop for Storage<S> {
 /// - `R` must fit in the slot.
 ///
 /// After return, slot contains a live `R`.
+///
+/// # Panics
+/// If `f(state)` panics, `F` has already been taken from the slot and `R` is
+/// never stored. The slot is left empty (`drop_fn` is `None`). Under unwinding,
+/// the caller waiting on `done` will block until dropped.
 unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &Storage<S>, state: &mut T) {
     // SAFETY: caller guarantees slot contains a live F and R fits.
     unsafe {
@@ -254,7 +280,11 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     }
 
     fn debug_assert_held(&self) {
-        debug_assert!(!self.try_acquire(), "slot accessed without being held");
+        self.state.lock(|cell| {
+            let s = cell.replace(SlotState::EMPTY);
+            debug_assert!(!s.free, "slot accessed without being held");
+            cell.set(s);
+        });
     }
 
     fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<()> {
@@ -484,6 +514,8 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
 
             // SAFETY: slot contains a live F, run_fn matches its types.
             // No other task can access the slot: the caller is waiting on done.
+            // Note: if the closure panics under unwinding, done is never signaled.
+            // The caller blocks until dropped, then ack allows recovery.
             unsafe { run_fn(&self.slot.storage, state) };
             self.slot.done.signal(());
 
