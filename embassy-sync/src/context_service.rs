@@ -397,13 +397,6 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     }
 }
 
-// TODO why phase up here lol.
-enum Phase {
-    Acquiring,
-    Submitted,
-    Done,
-}
-
 /// Dispatch closures for execution on a dedicated runner task.
 ///
 /// Callers submit an `FnOnce(&mut T) -> R` via [`call`](ContextService::call).
@@ -571,6 +564,13 @@ where
     Signal<M, RunFn<T, S>>: Sync,
     Signal<M, ()>: Sync,
 {
+}
+
+/// State of the [`CallFuture`]
+enum Phase {
+    Acquiring,
+    Submitted,
+    Done,
 }
 
 /// Future returned by [`ContextService::call`].
