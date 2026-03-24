@@ -660,6 +660,16 @@ mod tests {
     use futures_executor::block_on;
     use futures_util::pin_mut;
 
+    /// Run `caller` against `runner` until the caller completes.
+    async fn drive<R, N>(caller: impl Future<Output = R>, runner: impl Future<Output = N>) -> R {
+        pin_mut!(caller);
+        pin_mut!(runner);
+        match futures_util::future::select(caller, runner).await {
+            futures_util::future::Either::Left((r, _)) => r,
+            futures_util::future::Either::Right(_) => unreachable!(),
+        }
+    }
+
     fn add(n: i32) -> impl FnOnce(&mut i32) -> i32 + Send + 'static {
         move |s| {
             *s += n;
@@ -671,53 +681,44 @@ mod tests {
     async fn basic() {
         static SVC: ContextService<CriticalSectionRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = SVC.call(add(10));
-        let runner = SVC.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        match futures_util::future::select(caller, runner).await {
-            futures_util::future::Either::Left((r, _)) => assert_eq!(r, 10),
-            _ => panic!(),
-        }
+        assert_eq!(drive(SVC.call(add(10)), SVC.run(&mut state)).await, 10);
     }
 
     #[futures_test::test]
     async fn different_return_types() {
         let svc: ContextService<NoopRawMutex, Vec<String>, 256> = ContextService::new();
         let mut state = Vec::from([String::from("hello")]);
-        let caller = async {
-            assert_eq!(svc.call(|s| s.len()).await, 1);
-            svc.call(|s| s.push("world".into())).await;
-            assert_eq!(svc.call(|s| s.join(" ")).await, "hello world");
-        };
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        futures_util::future::select(caller, runner).await;
+        drive(
+            async {
+                assert_eq!(svc.call(|s| s.len()).await, 1);
+                svc.call(|s| s.push("world".into())).await;
+                assert_eq!(svc.call(|s| s.join(" ")).await, "hello world");
+            },
+            svc.run(&mut state),
+        )
+        .await;
     }
 
     #[futures_test::test]
     async fn cancel_before_acquire_then_next_call() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = async {
-            {
-                let fut = svc.call(add(100));
-                pin_mut!(fut);
-                assert!(
-                    futures_util::poll!(&mut fut).is_pending(),
-                    "slot should not be free without a runner"
-                );
-            }
-            svc.call(add(1)).await
-        };
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        match futures_util::future::select(caller, runner).await {
-            futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
-            _ => panic!(),
-        }
+        let r = drive(
+            async {
+                {
+                    let fut = svc.call(add(100));
+                    pin_mut!(fut);
+                    assert!(
+                        futures_util::poll!(&mut fut).is_pending(),
+                        "slot should not be free without a runner"
+                    );
+                }
+                svc.call(add(1)).await
+            },
+            svc.run(&mut state),
+        )
+        .await;
+        assert_eq!(r, 1);
     }
 
     #[futures_test::test]
@@ -791,11 +792,7 @@ mod tests {
         let mut state = 0i32;
 
         for _ in 0..10 {
-            let caller = svc.call(add(1));
-            let runner = svc.run(&mut state);
-            pin_mut!(caller);
-            pin_mut!(runner);
-            futures_util::future::select(caller, runner).await;
+            drive(svc.call(add(1)), svc.run(&mut state)).await;
         }
 
         assert_eq!(state, 10);
@@ -805,13 +802,7 @@ mod tests {
     async fn zero_sized_return() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = svc.call(|s| {
-            *s += 1;
-        });
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        futures_util::future::select(caller, runner).await;
+        drive(svc.call(|s| { *s += 1; }), svc.run(&mut state)).await;
     }
 
     #[futures_test::test]
