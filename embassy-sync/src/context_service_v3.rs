@@ -658,18 +658,16 @@ mod tests {
     use futures_executor::block_on;
     use futures_util::pin_mut;
 
+    fn add(n: i32) -> impl FnOnce(&mut i32) -> i32 + Send + 'static {
+        move |s| { *s += n; *s }
+    }
+
     #[futures_test::test]
     async fn basic() {
-        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+        static SVC: ContextService<CriticalSectionRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = async {
-            svc.call(|s| {
-                *s += 10;
-                *s
-            })
-            .await
-        };
-        let runner = svc.run(&mut state);
+        let caller = async { SVC.call(add(10)).await };
+        let runner = SVC.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
         match futures_util::future::select(caller, runner).await {
@@ -699,44 +697,17 @@ mod tests {
         let mut state = 0i32;
         let caller = async {
             {
-                let fut = svc.call(|s: &mut i32| {
-                    *s += 100;
-                    *s
-                });
+                let fut = svc.call(add(100));
                 pin_mut!(fut);
                 assert!(futures_util::poll!(&mut fut).is_pending(), "slot should not be free without a runner");
             }
-            svc.call(|s| {
-                *s += 1;
-                *s
-            })
-            .await
+            svc.call(add(1)).await
         };
         let runner = svc.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
         match futures_util::future::select(caller, runner).await {
             futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
-            _ => panic!(),
-        }
-    }
-
-    #[futures_test::test]
-    async fn const_init() {
-        static SVC: ContextService<CriticalSectionRawMutex, i32, 64> = ContextService::new();
-        let mut state = 0i32;
-        let caller = async {
-            SVC.call(|s| {
-                *s += 5;
-                *s
-            })
-            .await
-        };
-        let runner = SVC.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        match futures_util::future::select(caller, runner).await {
-            futures_util::future::Either::Left((r, _)) => assert_eq!(r, 5),
             _ => panic!(),
         }
     }
@@ -810,13 +781,7 @@ mod tests {
         let mut state = 0i32;
 
         for _ in 0..10 {
-            let caller = async {
-                svc.call(|s| {
-                    *s += 1;
-                    *s
-                })
-                .await
-            };
+            let caller = async { svc.call(add(1)).await };
             let runner = svc.run(&mut state);
             pin_mut!(caller);
             pin_mut!(runner);
@@ -830,12 +795,7 @@ mod tests {
     async fn zero_sized_return() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = async {
-            svc.call(|s| {
-                *s += 1;
-            })
-            .await
-        };
+        let caller = async { svc.call(|s| { *s += 1; }).await };
         let runner = svc.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
@@ -1008,13 +968,7 @@ mod tests {
         block_on(async {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
-            let caller = async {
-                svc.call(|s| {
-                    *s += 1;
-                    *s
-                })
-                .await
-            };
+            let caller = async { svc.call(add(1)).await };
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
@@ -1033,10 +987,7 @@ mod tests {
             pin_mut!(runner);
             let _ = futures_util::poll!(&mut runner);
 
-            let fut = svc.call(|s| {
-                *s += 1;
-                *s
-            });
+            let fut = svc.call(add(1));
             pin_mut!(fut);
 
             let _ = futures_util::poll!(&mut fut);
@@ -1061,10 +1012,7 @@ mod tests {
             let _ = futures_util::poll!(&mut runner);
         }
 
-        let caller = svc.call(|s| {
-            *s += 1;
-            *s
-        });
+        let caller = svc.call(add(1));
         pin_mut!(caller);
         let _ = futures_util::poll!(&mut caller);
 
