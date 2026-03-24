@@ -242,46 +242,6 @@ struct JobSlot<M: RawMutex, T, const S: usize> {
     ack: Signal<M, ()>,
 }
 
-/// Proof that the slot has been acquired. Releases the slot on drop
-/// unless consumed by `submit` or `submit_immediate`.
-struct SlotGuard<'a, M: RawMutex, T, const S: usize> {
-    slot: &'a JobSlot<M, T, S>,
-}
-
-impl<M: RawMutex, T, const S: usize> Drop for SlotGuard<'_, M, T, S> {
-    fn drop(&mut self) {
-        self.slot.mark_free();
-    }
-}
-
-impl<M: RawMutex, T, const S: usize> SlotGuard<'_, M, T, S> {
-    /// Store `f` in the slot and wake the runner.
-    ///
-    /// # Safety
-    /// `F` and `R` must fit in the slot (enforced by `assert_slot_fits` at the call site).
-    unsafe fn submit<R, F: FnOnce(&mut T) -> R>(self, f: F) {
-        let slot = self.slot;
-        mem::forget(self);
-        // SAFETY: guard proves slot is acquired, caller guarantees F and R fit.
-        unsafe { slot.storage.store(f) };
-        slot.job.signal(run_job::<T, R, F, S>);
-    }
-
-    /// Store `f` in the slot, pre-signal ack, and wake the runner.
-    /// Used for fire-and-forget calls where no one waits on `done`.
-    ///
-    /// # Safety
-    /// `F` must fit in the slot (enforced by `assert_slot_fits` at the call site).
-    unsafe fn submit_immediate<F: FnOnce(&mut T)>(self, f: F) {
-        let slot = self.slot;
-        mem::forget(self);
-        // SAFETY: guard proves slot is acquired, caller guarantees F fits.
-        unsafe { slot.storage.store(f) };
-        slot.ack.signal(());
-        slot.job.signal(run_job::<T, (), F, S>);
-    }
-}
-
 impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     const fn new() -> Self {
         Self {
@@ -294,16 +254,16 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     }
 
     fn debug_assert_held(&self) {
-        debug_assert!(self.try_acquire().is_none(), "slot accessed without being held");
+        debug_assert!(!self.try_acquire(), "slot accessed without being held");
     }
 
-    fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<SlotGuard<'_, M, T, S>> {
+    fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
             if s.free {
                 s.free = false;
                 cell.set(s);
-                Poll::Ready(SlotGuard { slot: self })
+                Poll::Ready(())
             } else {
                 s.waker.register(cx.waker());
                 cell.set(s);
@@ -312,18 +272,35 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         })
     }
 
-    fn try_acquire(&self) -> Option<SlotGuard<'_, M, T, S>> {
+    fn try_acquire(&self) -> bool {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
             if s.free {
                 s.free = false;
                 cell.set(s);
-                Some(SlotGuard { slot: self })
+                true
             } else {
                 cell.set(s);
-                None
+                false
             }
         })
+    }
+
+    /// # Safety
+    /// Caller must have acquired the slot. F and R must fit.
+    unsafe fn submit<R, F: FnOnce(&mut T) -> R>(&self, f: F) {
+        // SAFETY: caller guarantees slot is acquired and F/R fit.
+        unsafe { self.storage.store(f) };
+        self.job.signal(run_job::<T, R, F, S>);
+    }
+
+    /// # Safety
+    /// Caller must have acquired the slot. F must fit.
+    unsafe fn submit_immediate<F: FnOnce(&mut T)>(&self, f: F) {
+        // SAFETY: caller guarantees slot is acquired and F fits.
+        unsafe { self.storage.store(f) };
+        self.ack.signal(());
+        self.job.signal(run_job::<T, (), F, S>);
     }
 
     fn mark_free(&self) {
@@ -442,12 +419,12 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     {
         const { assert_slot_fits::<F, (), S>() };
 
-        let Some(guard) = self.slot.try_acquire() else {
+        if !self.slot.try_acquire() {
             return false;
-        };
+        }
 
-        // Safety: F fits (compile-time check above).
-        unsafe { guard.submit_immediate(f) };
+        // SAFETY: we just acquired the slot, F fits (compile-time check above).
+        unsafe { self.slot.submit_immediate(f) };
         true
     }
 
@@ -557,10 +534,10 @@ where
             match self.phase {
                 Phase::Acquiring => match self.svc.slot.poll_acquire(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(guard) => {
+                    Poll::Ready(()) => {
                         let f = self.f.take().unwrap();
-                        // SAFETY: F and R fit (compile-time check in call()).
-                        unsafe { guard.submit::<R, F>(f) };
+                        // SAFETY: we just acquired the slot, F and R fit (compile-time check in call()).
+                        unsafe { self.svc.slot.submit::<R, F>(f) };
                         self.phase = Phase::Submitted;
                     }
                 },
