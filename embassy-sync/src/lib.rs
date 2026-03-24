@@ -13,6 +13,7 @@ mod ring_buffer;
 
 pub mod blocking_mutex;
 pub mod channel;
+pub mod context_service;
 pub mod lazy_lock;
 pub mod mutex;
 pub mod once_lock;
@@ -25,4 +26,3 @@ pub mod signal;
 pub mod waitqueue;
 pub mod watch;
 pub mod zerocopy_channel;
-pub mod context_service_v3;

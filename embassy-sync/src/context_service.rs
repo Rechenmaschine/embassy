@@ -341,7 +341,10 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
             s.free = true;
             // Set the state to free before waking, so the woken caller
             // sees free=true when it re-enters poll_acquire.
-            cell.set(SlotState { free: true, waker: WakerRegistration::new() });
+            cell.set(SlotState {
+                free: true,
+                waker: WakerRegistration::new(),
+            });
             s.waker.wake();
         });
     }
@@ -513,9 +516,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         if self.running.swap(true, Ordering::AcqRel) {
             panic!("ContextService::run() must not be called concurrently")
         }
-        let _guard = RunGuard {
-            running: &self.running,
-        };
+        let _guard = RunGuard { running: &self.running };
 
         // If the previous runner was cancelled mid-job, the caller may still
         // be interacting with the slot. Wait for it to finish (the caller
@@ -600,13 +601,15 @@ where
                         self.phase = Phase::Submitted;
                     }
                 },
-                Phase::Submitted => return match self.svc.slot.poll_result::<R>(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
-                        self.phase = Phase::Done;
-                        Poll::Ready(result)
-                    }
-                },
+                Phase::Submitted => {
+                    return match self.svc.slot.poll_result::<R>(cx) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(result) => {
+                            self.phase = Phase::Done;
+                            Poll::Ready(result)
+                        }
+                    };
+                }
                 Phase::Done => panic!("CallFuture polled after completion"),
             }
         }
@@ -626,14 +629,8 @@ impl<M: RawMutex, T, R, F, const S: usize> Drop for CallFuture<'_, M, T, R, F, S
 }
 
 const fn assert_slot_fits<F, R, const S: usize>() {
-    assert!(
-        mem::size_of::<F>() <= S,
-        "closure must fit in slot, increase S"
-    );
-    assert!(
-        mem::size_of::<R>() <= S,
-        "return type must fit in slot, increase S"
-    );
+    assert!(mem::size_of::<F>() <= S, "closure must fit in slot, increase S");
+    assert!(mem::size_of::<R>() <= S, "return type must fit in slot, increase S");
     assert!(
         mem::align_of::<F>() <= mem::align_of::<Storage<S>>(),
         "closure alignment must not exceed 8 bytes"
@@ -659,7 +656,10 @@ mod tests {
     use futures_util::pin_mut;
 
     fn add(n: i32) -> impl FnOnce(&mut i32) -> i32 + Send + 'static {
-        move |s| { *s += n; *s }
+        move |s| {
+            *s += n;
+            *s
+        }
     }
 
     #[futures_test::test]
@@ -699,7 +699,10 @@ mod tests {
             {
                 let fut = svc.call(add(100));
                 pin_mut!(fut);
-                assert!(futures_util::poll!(&mut fut).is_pending(), "slot should not be free without a runner");
+                assert!(
+                    futures_util::poll!(&mut fut).is_pending(),
+                    "slot should not be free without a runner"
+                );
             }
             svc.call(add(1)).await
         };
@@ -755,7 +758,11 @@ mod tests {
             // Runner dropped while needs_recovery is true.
         }
 
-        assert_eq!(drop_count.load(Ordering::Relaxed), 0, "R should not be dropped before recovery");
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            0,
+            "R should not be dropped before recovery"
+        );
 
         {
             let runner = svc.run(&mut state);
@@ -793,7 +800,9 @@ mod tests {
     async fn zero_sized_return() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = svc.call(|s| { *s += 1; });
+        let caller = svc.call(|s| {
+            *s += 1;
+        });
         let runner = svc.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
@@ -829,7 +838,11 @@ mod tests {
             drop(caller);
             let _ = futures_util::poll!(&mut runner);
         }
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1, "service drop should drop slot contents");
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            1,
+            "service drop should drop slot contents"
+        );
     }
 
     #[futures_test::test]
@@ -857,7 +870,11 @@ mod tests {
             let _ = futures_util::poll!(&mut fut);
             let _ = futures_util::poll!(&mut runner);
         }
-        assert_eq!(drop_count.load(Ordering::Relaxed), 0, "R should not be dropped before runner cleanup");
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            0,
+            "R should not be dropped before runner cleanup"
+        );
 
         let _ = futures_util::poll!(&mut runner);
 
@@ -865,7 +882,11 @@ mod tests {
         pin_mut!(caller);
         futures_util::future::select(caller, runner).await;
 
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1, "runner should drop R during cleanup");
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            1,
+            "runner should drop R during cleanup"
+        );
     }
 
     #[futures_test::test]
