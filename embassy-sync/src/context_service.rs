@@ -471,19 +471,19 @@ impl<const S: usize> Drop for JobStorage<S> {
 const fn assert_slot_fits<F, R, const S: usize>() {
     assert!(
         mem::size_of::<F>() <= S,
-        "closure captures too large for ContextService slot — increase S"
+        "closure must fit in slot, increase S"
     );
     assert!(
         mem::size_of::<R>() <= S,
-        "return type too large for ContextService slot — increase S"
+        "return type must fit in slot, increase S"
     );
     assert!(
         mem::align_of::<F>() <= mem::align_of::<JobStorage<S>>(),
-        "closure alignment exceeds slot alignment"
+        "closure alignment must not exceed 8 bytes"
     );
     assert!(
         mem::align_of::<R>() <= mem::align_of::<JobStorage<S>>(),
-        "return type alignment exceeds slot alignment"
+        "return type alignment must not exceed 8 bytes"
     );
 }
 
@@ -505,7 +505,7 @@ mod tests {
 
     #[futures_test::test]
     async fn basic() {
-        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+        let svc: ContextService<NoopRawMutex, i32, 2> = ContextService::new();
         let mut state = 0i32;
         let caller = async {
             svc.call(|s| {
