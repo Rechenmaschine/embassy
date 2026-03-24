@@ -704,7 +704,7 @@ mod tests {
                     *s
                 });
                 pin_mut!(fut);
-                assert!(futures_util::poll!(&mut fut).is_pending());
+                assert!(futures_util::poll!(&mut fut).is_pending(), "slot should not be free without a runner");
             }
             svc.call(|s| {
                 *s += 1;
@@ -786,14 +786,14 @@ mod tests {
             // Runner dropped while needs_recovery is true.
         }
 
-        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0, "R should not be dropped before recovery");
 
         {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
             let _ = futures_util::poll!(&mut runner);
 
-            assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+            assert_eq!(drop_count.load(Ordering::Relaxed), 1, "recovery should drop R");
 
             let caller = async { svc.call(|_| 42u32).await };
             pin_mut!(caller);
@@ -871,7 +871,7 @@ mod tests {
             drop(caller);
             let _ = futures_util::poll!(&mut runner);
         }
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1, "service drop should drop slot contents");
     }
 
     #[futures_test::test]
@@ -899,7 +899,7 @@ mod tests {
             let _ = futures_util::poll!(&mut fut);
             let _ = futures_util::poll!(&mut runner);
         }
-        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0, "R should not be dropped before runner cleanup");
 
         let _ = futures_util::poll!(&mut runner);
 
@@ -907,7 +907,7 @@ mod tests {
         pin_mut!(caller);
         futures_util::future::select(caller, runner).await;
 
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1, "runner should drop R during cleanup");
     }
 
     #[futures_test::test]
@@ -966,7 +966,7 @@ mod tests {
                 let _ = futures_util::poll!(&mut runner);
             });
         }));
-        assert!(result.is_err());
+        assert!(result.is_err(), "destructor should have panicked");
 
         block_on(async {
             let runner = svc.run(&mut state);
@@ -1003,7 +1003,7 @@ mod tests {
                 let _ = futures_util::poll!(&mut runner);
             });
         }));
-        assert!(result.is_err());
+        assert!(result.is_err(), "closure should have panicked");
 
         block_on(async {
             let runner = svc.run(&mut state);
