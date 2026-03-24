@@ -704,9 +704,7 @@ mod tests {
                     *s
                 });
                 pin_mut!(fut);
-                // Poll once; slot is not free yet (no runner), so Pending.
                 assert!(futures_util::poll!(&mut fut).is_pending());
-                // Drop the future. The closure was never submitted.
             }
             svc.call(|s| {
                 *s += 1;
@@ -784,13 +782,10 @@ mod tests {
                 pin_mut!(fut);
                 let _ = futures_util::poll!(&mut fut);
                 let _ = futures_util::poll!(&mut runner);
-                // Drop caller: its Drop signals ack.
             }
-            // Runner is dropped here while needs_recovery is true.
+            // Runner dropped while needs_recovery is true.
         }
 
-        // Tracked return value should not have been dropped yet
-        // (it's in the slot, waiting for recovery).
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
 
         {
@@ -903,14 +898,11 @@ mod tests {
             pin_mut!(fut);
             let _ = futures_util::poll!(&mut fut);
             let _ = futures_util::poll!(&mut runner);
-            // Drop caller: ack is signalled, result stays in slot.
         }
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
 
-        // Runner picks up the ack and cleans up the slot.
         let _ = futures_util::poll!(&mut runner);
 
-        // Service should work again after cleanup.
         let caller = async { svc.call(|_| 42u32).await };
         pin_mut!(caller);
         futures_util::future::select(caller, runner).await;
@@ -923,21 +915,16 @@ mod tests {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
 
-        // No runner yet, slot is not free.
-        assert!(!svc.try_call_immediate(|s| *s += 100));
+        assert!(!svc.try_call_immediate(|s| *s += 100)); // no runner yet
 
         {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
             let _ = futures_util::poll!(&mut runner);
 
-            // Slot is now free.
             assert!(svc.try_call_immediate(|s| *s += 1));
+            assert!(!svc.try_call_immediate(|s| *s += 100)); // slot busy
 
-            // Slot is busy (job pending).
-            assert!(!svc.try_call_immediate(|s| *s += 100));
-
-            // Let the runner process the job.
             let _ = futures_util::poll!(&mut runner);
             let _ = futures_util::poll!(&mut runner);
         }
@@ -945,10 +932,8 @@ mod tests {
         assert_eq!(state, 1);
     }
 
-    /// Test that if the returned value's destructor panics during cleanup
-    /// (caller dropped after submission, runner drops R), the FinishGuard
-    /// recovers the service: slot is freed, needs_recovery is cleared,
-    /// and subsequent calls work.
+    /// R's destructor panics during cleanup after caller was dropped.
+    /// FinishGuard should recover the service.
     #[test]
     #[cfg(feature = "std")]
     fn destructor_panic_recovery() {
@@ -965,8 +950,6 @@ mod tests {
         let svc: ContextService<NoopRawMutex, (), 64> = ContextService::new();
         let mut state = ();
 
-        // Start the runner, submit a job that returns PanicOnDrop,
-        // then drop the caller so the runner has to clean up R.
         let result = catch_unwind(AssertUnwindSafe(|| {
             block_on(async {
                 let runner = svc.run(&mut state);
@@ -978,16 +961,13 @@ mod tests {
                     pin_mut!(fut);
                     let _ = futures_util::poll!(&mut fut);
                     let _ = futures_util::poll!(&mut runner);
-                    // Drop caller: signals ack without taking R.
                 }
 
-                // Runner receives ack, calls drop_contents() which panics.
                 let _ = futures_util::poll!(&mut runner);
             });
         }));
-        assert!(result.is_err(), "expected panic from destructor");
+        assert!(result.is_err());
 
-        // Service should be usable again.
         block_on(async {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
@@ -995,13 +975,13 @@ mod tests {
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
-                _ => panic!("expected caller to complete"),
+                _ => panic!(),
             }
         });
     }
 
-    /// Test that if the closure panics under unwinding, the caller is
-    /// stuck until dropped, after which the next runner recovers.
+    /// Closure panics during execution. Caller is dropped during unwind
+    /// (sending ack), next runner recovers.
     #[test]
     #[cfg(feature = "std")]
     fn closure_panic_recovery() {
@@ -1011,8 +991,6 @@ mod tests {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
 
-        // Start runner, submit a panicking closure.
-        // The runner will panic during execution.
         let result = catch_unwind(AssertUnwindSafe(|| {
             block_on(async {
                 let fut = svc.call(|_: &mut i32| -> i32 { panic!("closure panic") });
@@ -1020,21 +998,13 @@ mod tests {
 
                 let runner = svc.run(&mut state);
                 pin_mut!(runner);
-                // Runner initializes.
                 let _ = futures_util::poll!(&mut runner);
-                // Caller submits.
                 let _ = futures_util::poll!(&mut fut);
-                // Runner executes — closure panics.
                 let _ = futures_util::poll!(&mut runner);
             });
         }));
-        assert!(result.is_err(), "expected panic from closure");
+        assert!(result.is_err());
 
-        // The caller future was inside the catch_unwind and was dropped
-        // during unwinding. Its Drop sent ack (phase was Submitted).
-
-        // Service should recover: needs_recovery is true, next runner
-        // waits for ack (already sent by Drop), cleans up, works again.
         block_on(async {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
@@ -1048,7 +1018,7 @@ mod tests {
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
-                _ => panic!("expected caller to complete"),
+                _ => panic!(),
             }
         });
     }
@@ -1069,44 +1039,35 @@ mod tests {
             });
             pin_mut!(fut);
 
-            // Drive to completion.
             let _ = futures_util::poll!(&mut fut);
             let _ = futures_util::poll!(&mut runner);
             let _ = futures_util::poll!(&mut fut);
             let _ = futures_util::poll!(&mut runner);
 
-            // Poll again after Done — should panic.
-            let _ = futures_util::poll!(&mut fut);
+            let _ = futures_util::poll!(&mut fut); // poll after Done
         });
     }
 
-    /// Regression test: runner dropped with a pending job in the slot.
-    /// The new runner must process the pending job, not mark the slot free.
+    /// Runner dropped with a pending job in the slot.
+    /// New runner must process it, not mark the slot free.
     #[futures_test::test]
     async fn restart_with_pending_job() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
 
-        // Start and initialize the runner, then drop it.
         {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
-            // Poll to initialize (mark_free).
             let _ = futures_util::poll!(&mut runner);
         }
 
-        // Submit a job. The slot is free, so the caller acquires and submits.
         let caller = svc.call(|s| {
             *s += 1;
             *s
         });
         pin_mut!(caller);
-        // Poll caller: acquires slot, stores F, signals job. Then poll_result → Pending.
         let _ = futures_util::poll!(&mut caller);
 
-        // Now the slot contains F, job is signaled, but no runner is active.
-        // Start a new runner. It must NOT mark_free (initialized is true).
-        // It should pick up the pending job via job.wait().
         {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
