@@ -22,8 +22,10 @@ use crate::waitqueue::WakerRegistration;
 
 type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 
-// For various reasons, one might want to defer code from an async context
-// to a blocking context.
+// It is sometimes useful to dispatch blocking work from async tasks onto a
+// dedicated runner — for example to serialize access to a shared resource,
+// or to run blocking operations in a lower-priority task without stalling
+// the caller's executor.
 //
 // We would like to enable async callers to run FnOnce(&mut T) -> R on a shared
 // T, where T is owned by a single runner task. The interface should remain simple,
@@ -42,12 +44,12 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 //   - the closure was not yet submitted and is simply dropped, or
 //   - the closure was already submitted and will be executed by the
 //     runner to completion (the result is discarded).
-// In both cases, the service remains usable and applies backpressure
-// correctly: new callers are simply blocked until the slot is free.
+// In both cases, the service shoudl remain usable and apply backpressure
+// correctly s.t new callers are simply blocked until the slot is free.
 //
 // Since run() can also be cancelled, it would be reasonable for it to also
 // be restartable, that is, a new run() call must be able to pick up where the
-// previous one left off, recovering any in-flight state before accepting new work.
+// previous one left off, recovering any stale work before accepting new work.
 //
 // ## Implementation
 // Fundamentally, we need some shared memory between the caller and the runner for the
@@ -56,19 +58,18 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 // Stack-pinned memory on the caller side is not an option since after
 // submission, the runner may still be reading F or writing R when the
 // caller is dropped. We cannot block in Drop to wait for it to finish,
-// and also cannot interrupt the runner mid-execution either.
-//
-// Instead of living on the stack, our closure and result will live in a shared
+// and also cannot interrupt the runner mid-execution either. So instead
+// of living on the stack, our closure and result will live in a shared
 // fixed-size byte buffer ("slot"), owned by the ContextService with access
 // coordinated by a handshake protocol.
 //
-// Type erasure:
-//   The slot (Storage<S>) is an S-byte buffer. The caller writes its
-//   closure F into the slot via a pointer cast, then sends a function
-//   pointer run_job::<T, R, F, S> through the job signal. The runner
-//   calls this function pointer, which knows the concrete types: it
-//   takes F out of the slot, calls it, and writes R back. This lets
-//   the runner loop stay non-generic over F and R.
+// The slot (Storage<S>) is a statically sized S-byte buffer. The caller writes
+// its closure F into the slot via a pointer cast, then sends an erased function
+// pointer to run_job::<T, R, F, S> through the job signal. The runner calls
+// this function pointer, which takes F out of the slot, executes it, and
+// writes R back. The slot also stores a type-erased drop function so that
+// whoever cleans up (runner after ack, or Storage::drop) can drop the
+// contents without knowing the concrete type.
 //
 // Coordination uses a SlotState (behind a blocking mutex) and three signals:
 //
@@ -616,9 +617,9 @@ impl<M: RawMutex, T, R, F, const S: usize> Drop for CallFuture<'_, M, T, R, F, S
     fn drop(&mut self) {
         if matches!(self.phase, Phase::Submitted) {
             // Future dropped after the job was submitted. The runner will still
-            // finish executing the closure. We cannot touch the slot (the runner
-            // may still be using it) and we cannot block. Signal ack so the
-            // runner can clean up and accept new work.
+            // finish executing the closure, but we cannot touch the slot (the runner
+            // may still be using it) and we should not block. Signal ack so the
+            // runner can clean up and accept new work after it completes.
             self.svc.slot.ack.signal(());
         }
     }
