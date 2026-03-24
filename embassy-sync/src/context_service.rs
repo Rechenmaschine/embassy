@@ -1,26 +1,11 @@
-//! Execute blocking closures against `&mut T` on behalf of async callers.
+//! Async interface for dispatching `FnOnce(&mut T) -> R` jobs to a dedicated
+//! runner task with exclusive access to `T`.
 //!
-//! Zero-alloc. The future returned by [`ContextService::call`] is cancel-safe:
-//! dropping it at any await point is safe and the service remains usable.
-//!
-//! The runner future returned by [`ContextService::run`] is cancel-safe and
-//! restartable: dropping it at any await point is safe, and calling `run()`
-//! again will recover any in-flight state and resume processing. Callers
-//! that were blocked will transparently continue once a new runner starts.
-//!
-//! `S` is the inline storage capacity in bytes. Across all calls, both
-//! the closure capture and the return type must fit within `S` bytes and
-//! require no more alignment than the internal slot. Checked at compile time.
-//!
-//! The closure `f` passed to `call` must not unwind. Under
-//! `panic = "unwind"`, a panic in `f` poisons the in-flight call: the
-//! waiting caller will not receive a result, and recovery requires
-//! dropping that call future before the service can make progress again.
-//!
-//! The choice of `M: RawMutex` must match the execution context.
-//! `NoopRawMutex` is only safe within a single executor.
-//! Use `CriticalSectionRawMutex` (or similar) when sharing across
-//! interrupt priorities or executors.
+//! Callers submit an `FnOnce(&mut T) -> R` via [`ContextService::call`].
+//! A dedicated runner, started with [`ContextService::run`], executes
+//! closures one at a time with exclusive `&mut T` access and sends
+//! results back. Closures and return values are stored inline in a
+//! fixed-size slot of `S` bytes, checked at compile time.
 
 use crate::blocking_mutex::raw::RawMutex;
 use crate::semaphore::{GreedySemaphore, Semaphore, SemaphoreReleaser};
