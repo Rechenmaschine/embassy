@@ -136,9 +136,9 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 //     drop guard so a new run() can start after the old one is dropped.
 //
 // The key invariant is that every job signal is eventually followed by an
-// ack signal, no matter what gets dropped. CallFuture::drop sends ack if
-// the closure was already submitted. This guarantees the runner (or the
-// next runner, after recovery) can always make progress.
+// ack signal, provided the caller is eventually dropped. CallFuture::drop
+// sends ack if the closure was already submitted. This guarantees the
+// runner (or the next runner, after recovery) can always make progress.
 //
 // Assumptions about Signal semantics (embassy_sync::signal::Signal):
 //   - signal(v) is sticky: if signaled before wait(), the value is not lost.
@@ -149,10 +149,11 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 //   - wait() is cancel-safe: dropping the future does not consume the signal.
 //   - reset() clears any unconsumed value.
 //
-// Closures must not panic. Under panic=unwind, a panic in f(state) leaves
-// needs_recovery set and done unsignaled. The caller blocks until dropped,
-// at which point its Drop sends ack and the next runner can recover. This
-// is acceptable for embedded (panic=abort) but not robust under unwinding.
+// Closures must not unwind. Under panic=unwind, a panic in f(state) leaves
+// needs_recovery set and done unsignaled. The caller blocks until it is
+// dropped, at which point its Drop sends ack and the next runner can
+// recover. This provides best-effort recovery after drop, not continued
+// liveness — if the caller is never dropped, the service is wedged.
 
 struct SlotState {
     free: bool,
@@ -211,7 +212,7 @@ impl<const S: usize> Storage<S> {
     /// # Safety
     /// Caller must have exclusive access.
     ///
-    /// # Panics
+    /// # Panic behavior
     /// If the stored value's destructor panics, `drop_fn` is already
     /// cleared so double-drop will not occur. The buffer bytes remain
     /// and are overwritten by the next `store()`.
@@ -247,7 +248,7 @@ impl<const S: usize> Drop for Storage<S> {
 ///
 /// After return, slot contains a live `R`.
 ///
-/// # Panics
+/// # Panic behavior
 /// If `f(state)` panics, `F` has already been taken from the slot and `R` is
 /// never stored. The slot is left empty (`drop_fn` is `None`). Under unwinding,
 /// the caller waiting on `done` will block until dropped.
@@ -337,8 +338,10 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
             s.free = true;
+            // Set the state to free before waking, so the woken caller
+            // sees free=true when it re-enters poll_acquire.
+            cell.set(SlotState { free: true, waker: WakerRegistration::new() });
             s.waker.wake();
-            cell.set(s);
         });
     }
 
@@ -506,7 +509,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
             }
         }
 
-        if self.running.swap(true, Ordering::Acquire) {
+        if self.running.swap(true, Ordering::AcqRel) {
             panic!("ContextService::run() must not be called concurrently")
         }
         let _guard = RunGuard {
