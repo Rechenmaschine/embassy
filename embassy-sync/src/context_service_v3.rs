@@ -237,6 +237,46 @@ struct JobSlot<M: RawMutex, T, const S: usize> {
     ack: Signal<M, ()>,
 }
 
+/// Proof that the slot has been acquired. Releases the slot on drop
+/// unless consumed by `submit` or `submit_immediate`.
+struct SlotGuard<'a, M: RawMutex, T, const S: usize> {
+    slot: &'a JobSlot<M, T, S>,
+}
+
+impl<M: RawMutex, T, const S: usize> Drop for SlotGuard<'_, M, T, S> {
+    fn drop(&mut self) {
+        self.slot.mark_free();
+    }
+}
+
+impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
+    /// Store `f` in the slot and wake the runner.
+    ///
+    /// # Safety
+    /// `F` and `R` must fit in the slot (enforced by `assert_slot_fits` at the call site).
+    unsafe fn submit<R, F: FnOnce(&mut T) -> R>(self, f: F) {
+        let slot = self.slot;
+        mem::forget(self);
+        slot.debug_assert_held();
+        unsafe { slot.storage.store(f) };
+        slot.job.signal(run_job::<T, R, F, S>);
+    }
+
+    /// Store `f` in the slot, pre-signal ack, and wake the runner.
+    /// Used for fire-and-forget calls where no one waits on `done`.
+    ///
+    /// # Safety
+    /// `F` must fit in the slot (enforced by `assert_slot_fits` at the call site).
+    unsafe fn submit_immediate<F: FnOnce(&mut T)>(self, f: F) {
+        let slot = self.slot;
+        mem::forget(self);
+        slot.debug_assert_held();
+        unsafe { slot.storage.store(f) };
+        slot.ack.signal(());
+        slot.job.signal(run_job::<T, (), F, S>);
+    }
+}
+
 impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     const fn new() -> Self {
         Self {
@@ -248,13 +288,17 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<()> {
+    fn debug_assert_held(&self) {
+        debug_assert!(self.try_acquire().is_none(), "slot accessed without being held");
+    }
+
+    fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<SlotGuard<'_, M, T, S>> {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
             if s.free {
                 s.free = false;
                 cell.set(s);
-                Poll::Ready(())
+                Poll::Ready(SlotGuard { slot: self })
             } else {
                 s.waker.register(cx.waker());
                 cell.set(s);
@@ -263,16 +307,16 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         })
     }
 
-    fn try_acquire(&self) -> bool {
+    fn try_acquire(&self) -> Option<SlotGuard<'_, M, T, S>> {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
             if s.free {
                 s.free = false;
                 cell.set(s);
-                true
+                Some(SlotGuard { slot: self })
             } else {
                 cell.set(s);
-                false
+                None
             }
         })
     }
@@ -286,31 +330,12 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         });
     }
 
-    /// Store `f` in the slot and wake the runner.
-    ///
-    /// # Safety
-    /// Caller must have acquired the slot.
-    unsafe fn submit<R, F: FnOnce(&mut T) -> R>(&self, f: F) {
-        unsafe { self.storage.store(f) };
-        self.job.signal(run_job::<T, R, F, S>);
-    }
-
-    /// Store `f` in the slot, pre-signal ack, and wake the runner.
-    /// Used for fire-and-forget calls where no one waits on `done`.
-    ///
-    /// # Safety
-    /// Caller must have acquired the slot.
-    unsafe fn submit_immediate<F: FnOnce(&mut T)>(&self, f: F) {
-        unsafe { self.storage.store(f) };
-        self.ack.signal(());
-        self.job.signal(run_job::<T, (), F, S>);
-    }
-
     fn poll_result<R>(&self, cx: &mut Context<'_>) -> Poll<R> {
         let mut fut = self.done.wait();
         match Pin::new(&mut fut).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(()) => {
+                self.debug_assert_held();
                 // Safety: slot contains a live R written by run_job.
                 let result = unsafe { self.storage.take::<R>() };
                 self.ack.signal(());
@@ -319,18 +344,39 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    /// # Safety
-    /// Must have received ack, guaranteeing exclusive slot access.
-    unsafe fn finish(&self) {
+    /// Wait for a caller to submit a job. Returns a `ReceivedJob` that
+    /// must be consumed via `execute_and_signal`.
+    async fn wait_job(&self) -> ReceivedJob<'_, M, T, S> {
+        let run_fn = self.job.wait().await;
+        ReceivedJob { slot: self, run_fn }
+    }
+
+    /// Wait for the caller's ack, then clean up the slot and mark it free.
+    async fn wait_ack_and_finish(&self) {
+        self.ack.wait().await;
+        self.debug_assert_held();
+        // Safety: ack received, exclusive slot access.
         unsafe { self.storage.drop_contents() };
         self.done.reset();
         self.mark_free();
     }
+}
 
-    /// # Safety
-    /// Slot must contain a live F matching `run_fn`.
-    unsafe fn execute(&self, run_fn: RunFn<T, S>, state: &mut T) {
-        unsafe { run_fn(&self.storage, state) };
+/// A job received from a caller, ready to execute. Produced by
+/// `JobSlot::wait_job`, consumed by `execute_and_signal`.
+struct ReceivedJob<'a, M: RawMutex, T, const S: usize> {
+    slot: &'a JobSlot<M, T, S>,
+    run_fn: RunFn<T, S>,
+}
+
+impl<M: RawMutex, T, const S: usize> ReceivedJob<'_, M, T, S> {
+    /// Execute the closure with `state` and signal the caller that
+    /// the result is ready.
+    fn execute_and_signal(self, state: &mut T) {
+        // Safety: wait_job only returns after a caller stored a live F
+        // matching run_fn. No other task can access the slot.
+        unsafe { (self.run_fn)(&self.slot.storage, state) };
+        self.slot.done.signal(());
     }
 }
 
@@ -416,12 +462,12 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     {
         const { assert_slot_fits::<F, (), S>() };
 
-        if !self.slot.try_acquire() {
+        let Some(guard) = self.slot.try_acquire() else {
             return false;
-        }
+        };
 
-        // Safety: we just acquired the slot, F fits.
-        unsafe { self.slot.submit_immediate(f) };
+        // Safety: F fits (compile-time check above).
+        unsafe { guard.submit_immediate(f) };
         true
     }
 
@@ -459,44 +505,35 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         // be interacting with the slot. Wait for it to finish (the caller
         // always acks, either explicitly or via its Drop), then clean up.
         if self.needs_recovery.load(Ordering::Acquire) {
-            self.slot.ack.wait().await;
-            // Safety: ack received, exclusive slot access.
-            unsafe { self.slot.finish() };
+            self.slot.wait_ack_and_finish().await;
             self.needs_recovery.store(false, Ordering::Release);
         }
 
         // Mark the slot as free exactly once across all run() calls.
         // On restarts without recovery, the slot is either already free
-        // (previous finish() freed it) or contains a pending job that
-        // the runner will pick up via job.wait() below.
+        // (previous finish freed it) or contains a pending job that
+        // the runner will pick up via wait_job below.
         if !self.initialized.swap(true, Ordering::Relaxed) {
             self.slot.mark_free();
         }
 
         loop {
-            // Wait for a caller to submit a type-erased closure.
+            // Wait for a caller to submit a closure.
             // This is a clean cancellation point: no job is in flight.
-            let run_fn = self.slot.job.wait().await;
+            let job = self.slot.wait_job().await;
 
             // Mark in-flight so a subsequent run() knows to recover.
             self.needs_recovery.store(true, Ordering::Release);
 
-            // Safety: slot contains a live F, run_fn matches its types.
-            // No other task can access the slot: the caller is waiting on done.
-            unsafe { self.slot.execute(run_fn, state) };
+            // Execute the closure and tell the caller the result is ready.
+            job.execute_and_signal(state);
 
-            // Tell the caller that R is ready in the slot.
-            // Until ack, we may not access the storage.
-            self.slot.done.signal(());
-
-            // Wait for the caller to read R and signal ack,
-            // or for CallFuture::drop to signal ack on cancellation.
+            // Wait for the caller to read R and signal ack (or for
+            // CallFuture::drop to signal ack on cancellation), then
+            // clean up the slot and mark it free for the next caller.
             // If cancelled here, needs_recovery is true and the next
             // run() will wait for ack before touching the slot.
-            self.slot.ack.wait().await;
-
-            // Safety: ack received, exclusive slot access.
-            unsafe { self.slot.finish() };
+            self.slot.wait_ack_and_finish().await;
             self.needs_recovery.store(false, Ordering::Release);
         }
     }
@@ -537,10 +574,10 @@ where
             match self.phase {
                 Phase::Acquiring => match self.svc.slot.poll_acquire(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(()) => {
+                    Poll::Ready(guard) => {
                         let f = self.f.take().unwrap();
-                        // Safety: we just acquired the slot, F fits (compile-time check).
-                        unsafe { self.svc.slot.submit::<R, F>(f) };
+                        // Safety: F and R fit (compile-time check in call()).
+                        unsafe { guard.submit::<R, F>(f) };
                         self.phase = Phase::Submitted;
                     }
                 },
