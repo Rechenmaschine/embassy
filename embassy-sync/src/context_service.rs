@@ -996,26 +996,24 @@ mod tests {
         });
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(expected = "polled after completion")]
-    fn poll_after_completion_panics() {
-        block_on(async {
-            let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
-            let mut state = 0i32;
-            let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
+    async fn poll_after_completion_panics() {
+        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+        let mut state = 0i32;
+        let runner = svc.run(&mut state);
+        pin_mut!(runner);
+        let _ = futures_util::poll!(&mut runner);
 
-            let fut = svc.call(add(1));
-            pin_mut!(fut);
+        let fut = svc.call(add(1));
+        pin_mut!(fut);
 
-            let _ = futures_util::poll!(&mut fut);
-            let _ = futures_util::poll!(&mut runner);
-            let _ = futures_util::poll!(&mut fut);
-            let _ = futures_util::poll!(&mut runner);
+        let _ = futures_util::poll!(&mut fut);
+        let _ = futures_util::poll!(&mut runner);
+        let _ = futures_util::poll!(&mut fut);
+        let _ = futures_util::poll!(&mut runner);
 
-            let _ = futures_util::poll!(&mut fut); // poll after Done
-        });
+        let _ = futures_util::poll!(&mut fut); // poll after Done
     }
 
     /// Runner dropped with a pending job in the slot.
