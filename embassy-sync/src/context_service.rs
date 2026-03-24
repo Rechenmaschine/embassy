@@ -22,140 +22,134 @@ use crate::waitqueue::WakerRegistration;
 
 type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 
-// It is sometimes useful to dispatch blocking work from async tasks onto a
-// dedicated runner — for example to serialize access to a shared resource,
-// or to run blocking operations in a lower-priority task without stalling
-// the caller's executor.
-//
-// We would like to enable async callers to run FnOnce(&mut T) -> R on a shared
-// T, where T is owned by a single runner task. The interface should remain simple,
-// with a call() function to submit a closure and a run() function to drive execution.
-//
-// ## Design requirements
-// Ideally, each call should be able to have different F and R types. Since the
-// runner task will be unaware of the exact F and R, we will need to erase the type
-// of the closure and its return value.
-//
-// Like the existing primitives in embassy-sync, both call() and run()
-// should be cancel-safe: dropping either future at any await point must
-// leave the service in a consistent state and ready for further use.
-//
-// Particularly, when a call future is dropped, either:
-//   - the closure was not yet submitted and is simply dropped, or
-//   - the closure was already submitted and will be executed by the
-//     runner to completion (the result is discarded).
-// In both cases, the service shoudl remain usable and apply backpressure
-// correctly s.t new callers are simply blocked until the slot is free.
-//
-// Since run() can also be cancelled, it would be reasonable for it to also
-// be restartable, that is, a new run() call must be able to pick up where the
-// previous one left off, recovering any stale work before accepting new work.
-//
-// ## Implementation
-// Fundamentally, we need some shared memory between the caller and the runner for the
-// closure (and its captured environment) and the return value.
-//
-// Stack-pinned memory on the caller side is not an option since after
-// submission, the runner may still be reading F or writing R when the
-// caller is dropped. We cannot block in Drop to wait for it to finish,
-// and also cannot interrupt the runner mid-execution either. So instead
-// of living on the stack, our closure and result will live in a shared
-// fixed-size byte buffer ("slot"), owned by the ContextService with access
-// coordinated by a handshake protocol.
-//
-// The slot (Storage<S>) is a statically sized S-byte buffer. The caller writes
-// its closure F into the slot via a pointer cast, then sends an erased function
-// pointer to run_job::<T, R, F, S> through the job signal. The runner calls
-// this function pointer, which takes F out of the slot, executes it, and
-// writes R back. The slot also stores a type-erased drop function so that
-// whoever cleans up (runner after ack, or Storage::drop) can drop the
-// contents without knowing the concrete type.
-//
-// Coordination uses a SlotState (behind a blocking mutex) and three signals:
-//
-//   - state (Mutex<Cell<SlotState>>): a boolean `free` flag and a
-//     WakerRegistration. When a caller tries to acquire the slot and it
-//     is not free, the caller registers its waker here and returns
-//     Pending. When the runner finishes a job and marks the slot free,
-//     it wakes the registered waker. This is the same pattern that
-//     Channel uses for backpressure (senders_waker / receiver_waker).
-//   - job (Signal<RunFn>): caller -> runner. Carries the type-erased
-//     function pointer and wakes the runner to start executing.
-//   - done (Signal<()>): runner -> caller. Tells the caller that R is
-//     ready in the slot.
-//   - ack (Signal<()>): caller -> runner. Tells the runner the caller is
-//     done reading R and the slot can be cleaned up.
-//
-// The full handshake:
-//
-//   caller                           runner
-//     |                                |
-//     |---- acquire slot ------------->|
-//     |       store F into slot        |
-//     |---- signal job --------------->|
-//     |                          take F, execute it, store R
-//     |<--- signal done ---------------|
-//     |       take R from slot         |
-//     |---- signal ack --------------->|
-//     |                          drop slot contents, mark slot free
-//     |                                |
-//
-// Slot ownership follows during the handshake:
-//   - caller owns the slot between acquiring it and signalling job
-//   - runner owns the slot between receiving job and signalling done
-//   - caller owns the slot between receiving done and signalling ack
-//   - runner owns the slot between receiving ack and marking the slot free
-//
-// TODO: from here onwards doc needs work
-// To support cancellation and restartability, the handshake is extended
-// with a few atomic flags:
-//
-//   caller                          runner
-//     |                               |
-//     |                         [running = true, drop guard armed]
-//     |                         [if !initialized: mark slot free]
-//     |                               |
-//     |--- acquire slot ------------->|
-//     |    store F in slot            |
-//     |--- signal job --------------->|
-//     |                         [needs_recovery = true]
-//     |                         take F, execute it, store R
-//     |<-- signal done ---------------|
-//     |    take R from slot           |
-//     |--- signal ack --------------->|
-//     |                         drop slot contents
-//     |                         [needs_recovery = false]
-//     |                         mark slot free
-//     |                               |
-//
-//   The runner can be dropped at any await point (job.wait, ack.wait).
-//   If dropped while needs_recovery is true, the slot may still contain
-//   data and the caller may still be active. The next run() checks
-//   needs_recovery, waits for the caller's ack, and cleans up before
-//   entering the main loop.
-//
-//   running (AtomicBool): prevents concurrent runners. Cleared by a
-//     drop guard so a new run() can start after the old one is dropped.
-//
-// The key invariant is that every job signal is eventually followed by an
-// ack signal, provided the caller is eventually dropped. CallFuture::drop
-// sends ack if the closure was already submitted. This guarantees the
-// runner (or the next runner, after recovery) can always make progress.
-//
-// Assumptions about Signal semantics (embassy_sync::signal::Signal):
-//   - signal(v) is sticky: if signaled before wait(), the value is not lost.
-//   - wait() consumes exactly one value: returns Ready once, then resets to None.
-//   - signal() overwrites any unconsumed value (single-slot, last-writer-wins).
-//   - signal()/wait() provide at least release/acquire synchronization:
-//     writes before signal() are visible after wait() returns.
-//   - wait() is cancel-safe: dropping the future does not consume the signal.
-//   - reset() clears any unconsumed value.
-//
-// Closures must not unwind. Under panic=unwind, a panic in f(state) leaves
-// needs_recovery set and done unsignaled. The caller blocks until it is
-// dropped, at which point its Drop sends ack and the next runner can
-// recover. This provides best-effort recovery after drop, not continued
-// liveness — if the caller is never dropped, the service is wedged.
+/// It is sometimes useful to dispatch blocking work from async tasks onto a
+/// dedicated runner — for example to serialize access to a shared resource,
+/// or to run blocking operations in a lower-priority task without stalling
+/// the caller's executor.
+///
+/// We would like to enable async callers to run FnOnce(&mut T) -> R on a shared
+/// T, where T is owned by a single runner task. The interface should remain simple,
+/// with a call() function to submit a closure and a run() function to drive execution.
+///
+/// ## Design requirements
+/// Ideally, each call should be able to have different F and R types. Since the
+/// runner task will be unaware of the exact F and R, we will need to erase the type
+/// of the closure and its return value.
+///
+/// Like the existing primitives in embassy-sync, both call() and run()
+/// should be cancel-safe: dropping either future at any await point must
+/// leave the service in a consistent state and ready for further use.
+///
+/// Particularly, when a call future is dropped, either:
+///   - the closure was not yet submitted and is simply dropped, or
+///   - the closure was already submitted and will be executed by the
+///     runner to completion (the result is discarded).
+/// In both cases, the service should remain usable and apply backpressure
+/// correctly s.t new callers are simply blocked until the slot is free.
+///
+/// Since run() can also be cancelled, it would be reasonable for it to also
+/// be restartable, that is, a new run() call must be able to pick up where the
+/// previous one left off, recovering any stale work before accepting new work.
+///
+/// ## Implementation
+/// Fundamentally, we need some shared memory between the caller and the runner for the
+/// closure (and its captured environment) and the return value.
+///
+/// Stack-pinned memory on the caller side is not an option since after
+/// submission, the runner may still be reading F or writing R when the
+/// caller is dropped. We cannot block in Drop to wait for it to finish,
+/// and also cannot interrupt the runner mid-execution either. So instead
+/// of living on the stack, our closure and result will live in a shared
+/// fixed-size byte buffer ("slot"), owned by the ContextService with access
+/// coordinated by a handshake protocol.
+///
+/// The slot (`Storage<S>`) is a statically sized S-byte buffer. The caller writes
+/// its closure F into the slot via a pointer cast, then sends an erased function
+/// pointer to run_job::<T, R, F, S> through the job signal. The runner calls
+/// this function pointer, which takes F out of the slot, executes it, and
+/// writes R back. The slot also stores a type-erased drop function so that
+/// whoever cleans up (runner after ack, or Storage::drop) can drop the
+/// contents without knowing the concrete type.
+///
+/// Coordination uses a SlotState (behind a blocking mutex) and three signals:
+///
+///   - state (`Mutex<Cell<SlotState>>`): a boolean `free` flag and a
+///     WakerRegistration. When a caller tries to acquire the slot and it
+///     is not free, the caller registers its waker here and returns
+///     Pending. When the runner finishes a job and marks the slot free,
+///     it wakes the registered waker (This follows the same pattern that
+///     Channel uses for backpressure (senders_waker / receiver_waker)).
+///   - job (`Signal<RunFn>`): caller -> runner. Carries the type-erased
+///     function pointer and wakes the runner to start executing.
+///   - done (`Signal<()>`): runner -> caller. Tells the caller that R is
+///     ready in the slot.
+///   - ack (`Signal<()>`): caller -> runner. Tells the runner the caller is
+///     done reading R and the slot can be cleaned up.
+///
+/// The protocol:
+///```text
+///   caller                           runner
+///     |                                |
+///     |---- acquire slot ------------->|
+///     |       store F into slot        |
+///     |---- signal job --------------->|
+///     |                          take F, execute it, store R
+///     |<--- signal done ---------------|
+///     |       take R from slot         |
+///     |---- signal ack --------------->|
+///     |                          drop slot contents, mark slot free
+///     |                                |
+///```
+/// Slot ownership according to the protocol:
+///   - caller owns the slot between acquiring it and signalling job
+///   - runner owns the slot between receiving job and signalling done
+///   - caller owns the slot between receiving done and signalling ack
+///   - runner owns the slot between receiving ack and marking the slot free
+///
+/// To support cancellation and restartabilty of run(), we can extend the above
+/// with a few atomic flags:
+///    - running
+///    - needs_recovery
+///    - initialized
+///
+/// ```text
+///   caller                          runner
+///     |                               |
+///     |                         [running = true, drop guard armed]
+///     |                         [if !initialized: mark slot free]
+///     |                               |
+///     |--- acquire slot ------------->|
+///     |    store F in slot            |
+///     |--- signal job --------------->|
+///     |                         [needs_recovery = true]
+///     |                         take F, execute it, store R
+///     |<-- signal done ---------------|
+///     |    take R from slot           |
+///     |--- signal ack --------------->|
+///     |                         drop slot contents
+///     |                         [needs_recovery = false]
+///     |                         mark slot free
+///     |                               |
+/// ```
+/// The runner can be dropped at any await point (job.wait, ack.wait).
+/// If dropped while needs_recovery is true, the slot may still contain
+/// data and the caller may still be active. The next run() checks
+/// needs_recovery, waits for the caller's ack, and cleans up before
+/// entering the main loop.
+///
+/// running (AtomicBool): prevents concurrent runners. This is cleared by a
+/// drop guard so a new run() can start after the old one is dropped.
+///
+/// The key invariant is that **every job signal is eventually followed by an
+/// ack signal**, provided the caller is eventually dropped. CallFuture::drop
+/// sends ack if the closure was already submitted. This guarantees the
+/// runner (or the next runner, after recovery) can always make progress.
+///
+/// Closures must not unwind. Under panic=unwind, a panic in f(state) leaves
+/// needs_recovery set and done unsignaled. The caller blocks until it is
+/// dropped, at which point its Drop sends ack and the next runner can
+/// recover. This provides best-effort recovery after drop, not continued
+/// liveness — if the caller is never dropped, the service is wedged.
 
 struct SlotState {
     free: bool,
@@ -284,7 +278,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    // TODO: documentation needed?
+    // TODO: documentation needed
 
     fn debug_assert_held(&self) {
         self.state.lock(|cell| {
