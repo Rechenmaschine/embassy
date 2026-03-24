@@ -666,7 +666,7 @@ mod tests {
     async fn basic() {
         static SVC: ContextService<CriticalSectionRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = async { SVC.call(add(10)).await };
+        let caller = SVC.call(add(10));
         let runner = SVC.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
@@ -712,20 +712,18 @@ mod tests {
         }
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(expected = "must not be called concurrently")]
-    fn concurrent_run_panics() {
-        block_on(async {
-            let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
-            let mut s1 = 0;
-            let mut s2 = 0;
-            let a = svc.run(&mut s1);
-            let b = svc.run(&mut s2);
-            pin_mut!(a);
-            pin_mut!(b);
-            let _ = futures_util::poll!(&mut a);
-            let _ = futures_util::poll!(&mut b);
-        });
+    async fn concurrent_run_panics() {
+        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+        let mut s1 = 0;
+        let mut s2 = 0;
+        let a = svc.run(&mut s1);
+        let b = svc.run(&mut s2);
+        pin_mut!(a);
+        pin_mut!(b);
+        let _ = futures_util::poll!(&mut a);
+        let _ = futures_util::poll!(&mut b);
     }
 
     #[futures_test::test]
@@ -766,7 +764,7 @@ mod tests {
 
             assert_eq!(drop_count.load(Ordering::Relaxed), 1, "recovery should drop R");
 
-            let caller = async { svc.call(|_| 42u32).await };
+            let caller = svc.call(|_| 42u32);
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
@@ -781,7 +779,7 @@ mod tests {
         let mut state = 0i32;
 
         for _ in 0..10 {
-            let caller = async { svc.call(add(1)).await };
+            let caller = svc.call(add(1));
             let runner = svc.run(&mut state);
             pin_mut!(caller);
             pin_mut!(runner);
@@ -795,7 +793,7 @@ mod tests {
     async fn zero_sized_return() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
-        let caller = async { svc.call(|s| { *s += 1; }).await };
+        let caller = svc.call(|s| { *s += 1; });
         let runner = svc.run(&mut state);
         pin_mut!(caller);
         pin_mut!(runner);
@@ -863,7 +861,7 @@ mod tests {
 
         let _ = futures_util::poll!(&mut runner);
 
-        let caller = async { svc.call(|_| 42u32).await };
+        let caller = svc.call(|_| 42u32);
         pin_mut!(caller);
         futures_util::future::select(caller, runner).await;
 
@@ -931,7 +929,7 @@ mod tests {
         block_on(async {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
-            let caller = async { svc.call(|_| 42u32).await };
+            let caller = svc.call(|_| 42u32);
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
@@ -968,7 +966,7 @@ mod tests {
         block_on(async {
             let runner = svc.run(&mut state);
             pin_mut!(runner);
-            let caller = async { svc.call(add(1)).await };
+            let caller = svc.call(add(1));
             pin_mut!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
