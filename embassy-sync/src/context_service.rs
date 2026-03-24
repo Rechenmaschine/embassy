@@ -106,6 +106,7 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 //   - caller owns the slot between receiving done and signalling ack
 //   - runner owns the slot between receiving ack and marking the slot free
 //
+// TODO: from here onwards doc needs work
 // To support cancellation and restartability, the handshake is extended
 // with a few atomic flags:
 //
@@ -176,6 +177,7 @@ impl SlotState {
 /// - `take<T>()` reads a `T` out and clears `drop_fn`
 /// - `drop_contents()` drops in place if occupied; no-op if empty
 #[repr(C, align(8))]
+//TODO: is 8 aligned ok?
 struct Storage<const S: usize> {
     buf: UnsafeCell<MaybeUninit<[u8; S]>>,
     drop_fn: UnsafeCell<Option<unsafe fn(&Self)>>,
@@ -253,6 +255,7 @@ impl<const S: usize> Drop for Storage<S> {
 /// If `f(state)` panics, `F` has already been taken from the slot and `R` is
 /// never stored. The slot is left empty (`drop_fn` is `None`). Under unwinding,
 /// the caller waiting on `done` will block until dropped.
+// TODO check panic behaviour in more detail
 unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &Storage<S>, state: &mut T) {
     // SAFETY: caller guarantees slot contains a live F and R fits.
     unsafe {
@@ -280,6 +283,8 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
             ack: Signal::new(),
         }
     }
+
+    // TODO: documentation needed?
 
     fn debug_assert_held(&self) {
         self.state.lock(|cell| {
@@ -363,6 +368,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
+    // TODO: make docs more concise, and check correctness.
     /// Wait for the caller's ack, then clean up the slot and mark it free.
     ///
     /// If the stored value's destructor panics under unwinding, the slot
@@ -399,6 +405,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     }
 }
 
+// TODO why phase up here lol.
 enum Phase {
     Acquiring,
     Submitted,
