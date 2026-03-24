@@ -39,6 +39,96 @@ unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &JobStorag
     }
 }
 
+// The core problem: async callers want to run FnOnce(&mut T) -> R on a
+// shared T, but T is owned by a single runner task. Each call can have
+// different F and R types, so we need to pass closures and results
+// through a single, non-generic communication channel.
+//
+// We solve this with a fixed-size byte buffer ("slot") that both sides
+// read and write and that is coordinated by a handshake protocol.
+//
+// Type erasure:
+//   The slot (JobStorage<S>) is an S-byte buffer. The caller writes its
+//   closure F into the slot via a pointer cast, then sends a function
+//   pointer run_job::<T, R, F, S> through the job signal. The runner
+//   calls this function pointer, which knows the concrete types: it
+//   takes F out of the slot, calls it, and writes R back. This lets
+//   the runner loop stay non-generic over F and R.
+//
+// The core coordination happens with four primitives:
+//   - permit (semaphore): ensures only one caller uses the slot at a time.
+//   - job (Signal<RunFn>): caller -> runner. Carries the function pointer
+//     and wakes the runner to start executing.
+//   - done (Signal<()>): runner -> caller. Tells the caller that R is
+//     ready in the slot.
+//   - ack (Signal<()>): caller -> runner. Tells the runner the caller is
+//     done reading R and the slot can be cleaned up.
+//
+// The full handshake:
+//
+//   caller                           runner
+//     |                                |
+//     |---- acquire permit ----------->|
+//     |       store F into slot        |
+//     |---- signal job --------------->|
+//     |                          take F, execute it, store R
+//     |<--- signal done ---------------|
+//     |       take R from slot         |
+//     |---- signal ack --------------->|
+//     |                          drop slot contents, release permit
+//     |                                |
+//
+// Slot ownership follows during the handshake:
+//   - caller owns the slot between acquiring the permit and signalling job
+//   - runner owns the slot between receiving job and signalling done
+//   - caller owns the slot between receiving done and signalling ack
+//   - runner owns the slot between receiving ack and releasing the permit
+//
+// Design requirements:
+//   Both call() and run() must be cancel-safe: dropping either future at
+//   any await point must leave the service in a consistent state. A
+//   dropped call() before submission does nothing. A dropped call() after
+//   submission lets the runner finish the closure, but the result is
+//   discarded. Since run() can be cancelled, it should also be
+//   restartable: a new run() call picks up where the previous one left
+//   off. This requires considerations for recovering inconsistent state.
+//
+// The full handshake is extended a few atomic flags:
+//
+//   caller                          runner
+//     |                               |
+//     |                         [running = true, drop guard armed]
+//     |                         [initialized = true, release initial permit]
+//     |                               |
+//     |--- acquire permit ----------->|
+//     |    store F in slot            |
+//     |--- signal job --------------->|
+//     |                         [needs_recovery = true]
+//     |                         take F, execute it, store R
+//     |<-- signal done ---------------|
+//     |    take R from slot           |
+//     |--- signal ack --------------->|
+//     |                         drop slot contents
+//     |                         [needs_recovery = false]
+//     |                         release permit
+//     |                               |
+//
+//   The runner can be dropped at any await point (job.wait, ack.wait).
+//   If dropped while needs_recovery is true, the slot may still contain
+//   data and the caller may still be active. The next run() checks
+//   needs_recovery, waits for the caller's ack, and cleans up before
+//   entering the main loop.
+//
+//   running (AtomicBool): prevents concurrent runners. Cleared by a
+//     drop guard so a new run() can start after the old one is dropped.
+//   initialized (AtomicBool): ensures the initial semaphore permit is
+//     released exactly once, even across multiple run() restarts.
+//
+// The key invariant is that every job signal is eventually followed by an
+// ack signal, no matter what gets dropped. CallFuture::drop sends ack if
+// the closure was already submitted. This guarantees the runner (or the
+// next runner, after recovery) can always make progress.
+
 /// Serializes closure execution against `&mut T` on a dedicated runner task.
 ///
 /// Callers submit an `FnOnce(&mut T) -> R` via [`call`](ContextService::call).
