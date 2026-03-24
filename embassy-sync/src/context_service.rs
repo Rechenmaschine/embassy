@@ -658,12 +658,12 @@ mod tests {
     use super::*;
     use crate::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
     use futures_executor::block_on;
-    use futures_util::pin_mut;
+    use core::pin::pin;
 
     /// Run `caller` against `runner` until the caller completes.
     async fn drive<R, N>(caller: impl Future<Output = R>, runner: impl Future<Output = N>) -> R {
-        pin_mut!(caller);
-        pin_mut!(runner);
+        let mut caller = pin!(caller);
+        let mut runner = pin!(runner);
         match futures_util::future::select(caller, runner).await {
             futures_util::future::Either::Left((r, _)) => r,
             futures_util::future::Either::Right(_) => unreachable!(),
@@ -707,9 +707,9 @@ mod tests {
             async {
                 {
                     let fut = svc.call(add(100));
-                    pin_mut!(fut);
+                    let mut fut = pin!(fut);
                     assert!(
-                        futures_util::poll!(&mut fut).is_pending(),
+                        futures_util::poll!(fut.as_mut()).is_pending(),
                         "slot should not be free without a runner"
                     );
                 }
@@ -729,10 +729,10 @@ mod tests {
         let mut s2 = 0;
         let a = svc.run(&mut s1);
         let b = svc.run(&mut s2);
-        pin_mut!(a);
-        pin_mut!(b);
-        let _ = futures_util::poll!(&mut a);
-        let _ = futures_util::poll!(&mut b);
+        let mut a = pin!(a);
+        let mut b = pin!(b);
+        let _ = futures_util::poll!(a.as_mut());
+        let _ = futures_util::poll!(b.as_mut());
     }
 
     #[futures_test::test]
@@ -751,15 +751,15 @@ mod tests {
 
         {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
+            let mut runner = pin!(runner);
+            let _ = futures_util::poll!(runner.as_mut());
 
             {
                 let dc = drop_count.clone();
                 let fut = svc.call(move |_| Tracked(dc));
-                pin_mut!(fut);
-                let _ = futures_util::poll!(&mut fut);
-                let _ = futures_util::poll!(&mut runner);
+                let mut fut = pin!(fut);
+                let _ = futures_util::poll!(fut.as_mut());
+                let _ = futures_util::poll!(runner.as_mut());
             }
             // Runner dropped while needs_recovery is true.
         }
@@ -772,13 +772,13 @@ mod tests {
 
         {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
+            let mut runner = pin!(runner);
+            let _ = futures_util::poll!(runner.as_mut());
 
             assert_eq!(drop_count.load(Ordering::Relaxed), 1, "recovery should drop R");
 
             let caller = svc.call(|_| 42u32);
-            pin_mut!(caller);
+            let mut caller = pin!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
                 _ => panic!(),
@@ -822,17 +822,17 @@ mod tests {
             let dc = drop_count.clone();
             let caller = async {
                 let fut = svc.call(move |_| Payload(dc));
-                pin_mut!(fut);
-                assert!(futures_util::poll!(&mut fut).is_pending());
+                let mut fut = pin!(fut);
+                assert!(futures_util::poll!(fut.as_mut()).is_pending());
             };
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
-            pin_mut!(caller);
-            let _ = futures_util::poll!(&mut caller);
-            let _ = futures_util::poll!(&mut runner);
+            let mut runner = pin!(runner);
+            let _ = futures_util::poll!(runner.as_mut());
+            let mut caller = pin!(caller);
+            let _ = futures_util::poll!(caller.as_mut());
+            let _ = futures_util::poll!(runner.as_mut());
             drop(caller);
-            let _ = futures_util::poll!(&mut runner);
+            let _ = futures_util::poll!(runner.as_mut());
         }
         assert_eq!(
             drop_count.load(Ordering::Relaxed),
@@ -856,15 +856,15 @@ mod tests {
         let mut state = ();
 
         let runner = svc.run(&mut state);
-        pin_mut!(runner);
-        let _ = futures_util::poll!(&mut runner);
+        let mut runner = pin!(runner);
+        let _ = futures_util::poll!(runner.as_mut());
 
         {
             let dc = drop_count.clone();
             let fut = svc.call(move |_| Heavy(dc, [0xAB; 64]));
-            pin_mut!(fut);
-            let _ = futures_util::poll!(&mut fut);
-            let _ = futures_util::poll!(&mut runner);
+            let mut fut = pin!(fut);
+            let _ = futures_util::poll!(fut.as_mut());
+            let _ = futures_util::poll!(runner.as_mut());
         }
         assert_eq!(
             drop_count.load(Ordering::Relaxed),
@@ -872,10 +872,10 @@ mod tests {
             "R should not be dropped before runner cleanup"
         );
 
-        let _ = futures_util::poll!(&mut runner);
+        let _ = futures_util::poll!(runner.as_mut());
 
         let caller = svc.call(|_| 42u32);
-        pin_mut!(caller);
+        let mut caller = pin!(caller);
         futures_util::future::select(caller, runner).await;
 
         assert_eq!(
@@ -894,14 +894,14 @@ mod tests {
 
         {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
+            let mut runner = pin!(runner);
+            let _ = futures_util::poll!(runner.as_mut());
 
             assert!(svc.try_call_immediate(|s| *s += 1));
             assert!(!svc.try_call_immediate(|s| *s += 100)); // slot busy
 
-            let _ = futures_util::poll!(&mut runner);
-            let _ = futures_util::poll!(&mut runner);
+            let _ = futures_util::poll!(runner.as_mut());
+            let _ = futures_util::poll!(runner.as_mut());
         }
 
         assert_eq!(state, 1);
@@ -928,26 +928,26 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(|| {
             block_on(async {
                 let runner = svc.run(&mut state);
-                pin_mut!(runner);
-                let _ = futures_util::poll!(&mut runner);
+                let mut runner = pin!(runner);
+                let _ = futures_util::poll!(runner.as_mut());
 
                 {
                     let fut = svc.call(|_| PanicOnDrop);
-                    pin_mut!(fut);
-                    let _ = futures_util::poll!(&mut fut);
-                    let _ = futures_util::poll!(&mut runner);
+                    let mut fut = pin!(fut);
+                    let _ = futures_util::poll!(fut.as_mut());
+                    let _ = futures_util::poll!(runner.as_mut());
                 }
 
-                let _ = futures_util::poll!(&mut runner);
+                let _ = futures_util::poll!(runner.as_mut());
             });
         }));
         assert!(result.is_err(), "destructor should have panicked");
 
         block_on(async {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
+            let mut runner = pin!(runner);
             let caller = svc.call(|_| 42u32);
-            pin_mut!(caller);
+            let mut caller = pin!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
                 _ => panic!(),
@@ -969,22 +969,22 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(|| {
             block_on(async {
                 let fut = svc.call(|_: &mut i32| -> i32 { panic!("closure panic") });
-                pin_mut!(fut);
+                let mut fut = pin!(fut);
 
                 let runner = svc.run(&mut state);
-                pin_mut!(runner);
-                let _ = futures_util::poll!(&mut runner);
-                let _ = futures_util::poll!(&mut fut);
-                let _ = futures_util::poll!(&mut runner);
+                let mut runner = pin!(runner);
+                let _ = futures_util::poll!(runner.as_mut());
+                let _ = futures_util::poll!(fut.as_mut());
+                let _ = futures_util::poll!(runner.as_mut());
             });
         }));
         assert!(result.is_err(), "closure should have panicked");
 
         block_on(async {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
+            let mut runner = pin!(runner);
             let caller = svc.call(add(1));
-            pin_mut!(caller);
+            let mut caller = pin!(caller);
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
                 _ => panic!(),
@@ -998,18 +998,18 @@ mod tests {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
         let runner = svc.run(&mut state);
-        pin_mut!(runner);
-        let _ = futures_util::poll!(&mut runner);
+        let mut runner = pin!(runner);
+        let _ = futures_util::poll!(runner.as_mut());
 
         let fut = svc.call(add(1));
-        pin_mut!(fut);
+        let mut fut = pin!(fut);
 
-        let _ = futures_util::poll!(&mut fut);
-        let _ = futures_util::poll!(&mut runner);
-        let _ = futures_util::poll!(&mut fut);
-        let _ = futures_util::poll!(&mut runner);
+        let _ = futures_util::poll!(fut.as_mut());
+        let _ = futures_util::poll!(runner.as_mut());
+        let _ = futures_util::poll!(fut.as_mut());
+        let _ = futures_util::poll!(runner.as_mut());
 
-        let _ = futures_util::poll!(&mut fut); // poll after Done
+        let _ = futures_util::poll!(fut.as_mut()); // poll after Done
     }
 
     /// Runner dropped with a pending job in the slot.
@@ -1021,17 +1021,17 @@ mod tests {
 
         {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
-            let _ = futures_util::poll!(&mut runner);
+            let mut runner = pin!(runner);
+            let _ = futures_util::poll!(runner.as_mut());
         }
 
         let caller = svc.call(add(1));
-        pin_mut!(caller);
-        let _ = futures_util::poll!(&mut caller);
+        let mut caller = pin!(caller);
+        let _ = futures_util::poll!(caller.as_mut());
 
         {
             let runner = svc.run(&mut state);
-            pin_mut!(runner);
+            let mut runner = pin!(runner);
 
             match futures_util::future::select(caller, runner).await {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
