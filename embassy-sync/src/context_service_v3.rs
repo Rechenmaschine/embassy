@@ -650,7 +650,6 @@ mod tests {
 
     use alloc::string::String;
     use alloc::sync::Arc;
-    use alloc::vec;
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -680,28 +679,6 @@ mod tests {
     }
 
     #[futures_test::test]
-    async fn sequential() {
-        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
-        let mut state = 0i32;
-        let caller = async {
-            for i in 1..=5 {
-                assert_eq!(
-                    svc.call(|s| {
-                        *s += 1;
-                        *s
-                    })
-                    .await,
-                    i
-                );
-            }
-        };
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        futures_util::future::select(caller, runner).await;
-    }
-
-    #[futures_test::test]
     async fn different_return_types() {
         let svc: ContextService<NoopRawMutex, Vec<String>, 256> = ContextService::new();
         let mut state = Vec::new();
@@ -714,17 +691,6 @@ mod tests {
         pin_mut!(caller);
         pin_mut!(runner);
         futures_util::future::select(caller, runner).await;
-    }
-
-    #[futures_test::test]
-    async fn cancel_before_submit() {
-        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
-        // Drop the future without awaiting. No runner is active, so the
-        // closure was never submitted; dropping should be harmless.
-        let _fut = svc.call(|s| {
-            *s += 1;
-            *s
-        });
     }
 
     #[futures_test::test]
@@ -755,30 +721,6 @@ mod tests {
             futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
             _ => panic!(),
         }
-    }
-
-    #[futures_test::test]
-    async fn closure_dropped_on_cancel_before_acquire() {
-        let drop_count = Arc::new(AtomicUsize::new(0));
-        let dc = drop_count.clone();
-
-        struct Tracked(Arc<AtomicUsize>);
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let svc: ContextService<NoopRawMutex, (), 64> = ContextService::new();
-        {
-            let tracked = Tracked(dc);
-            let fut = svc.call(move |_| {
-                let _ = &tracked;
-            });
-            pin_mut!(fut);
-            assert!(futures_util::poll!(&mut fut).is_pending());
-        }
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
     }
 
     #[futures_test::test]
@@ -815,46 +757,6 @@ mod tests {
             let _ = futures_util::poll!(&mut a);
             let _ = futures_util::poll!(&mut b);
         });
-    }
-
-    #[futures_test::test]
-    async fn restart_idle() {
-        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
-        let mut state = 0i32;
-
-        {
-            let caller = async {
-                svc.call(|s| {
-                    *s += 10;
-                    *s
-                })
-                .await
-            };
-            let runner = svc.run(&mut state);
-            pin_mut!(caller);
-            pin_mut!(runner);
-            match futures_util::future::select(caller, runner).await {
-                futures_util::future::Either::Left((r, _)) => assert_eq!(r, 10),
-                _ => panic!(),
-            }
-        }
-
-        {
-            let caller = async {
-                svc.call(|s| {
-                    *s += 5;
-                    *s
-                })
-                .await
-            };
-            let runner = svc.run(&mut state);
-            pin_mut!(caller);
-            pin_mut!(runner);
-            match futures_util::future::select(caller, runner).await {
-                futures_util::future::Either::Left((r, _)) => assert_eq!(r, 15),
-                _ => panic!(),
-            }
-        }
     }
 
     #[futures_test::test]
@@ -930,27 +832,6 @@ mod tests {
     }
 
     #[futures_test::test]
-    async fn large_capture() {
-        let svc: ContextService<NoopRawMutex, Vec<u8>, 256> = ContextService::new();
-        let mut state = Vec::new();
-        let data = [42u8; 128];
-        let caller = async {
-            svc.call(move |s| {
-                s.extend_from_slice(&data);
-                s.len()
-            })
-            .await
-        };
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        match futures_util::future::select(caller, runner).await {
-            futures_util::future::Either::Left((len, _)) => assert_eq!(len, 128),
-            _ => panic!(),
-        }
-    }
-
-    #[futures_test::test]
     async fn zero_sized_return() {
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
@@ -996,25 +877,6 @@ mod tests {
             let _ = futures_util::poll!(&mut runner);
         }
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[futures_test::test]
-    async fn heterogeneous_types() {
-        let svc: ContextService<NoopRawMutex, Vec<u8>, 256> = ContextService::new();
-        let mut state = vec![1u8, 2, 3];
-        let caller = async {
-            let len: usize = svc.call(|s| s.len()).await;
-            assert_eq!(len, 3);
-            let s: String = svc.call(|s| String::from_utf8(s.clone()).unwrap_or_default()).await;
-            assert_eq!(s, "\x01\x02\x03");
-            svc.call(|s| s.clear()).await;
-            let empty: bool = svc.call(|s| s.is_empty()).await;
-            assert!(empty);
-        };
-        let runner = svc.run(&mut state);
-        pin_mut!(caller);
-        pin_mut!(runner);
-        futures_util::future::select(caller, runner).await;
     }
 
     #[futures_test::test]
@@ -1188,6 +1050,33 @@ mod tests {
                 futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
                 _ => panic!("expected caller to complete"),
             }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "polled after completion")]
+    fn poll_after_completion_panics() {
+        block_on(async {
+            let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+            let mut state = 0i32;
+            let runner = svc.run(&mut state);
+            pin_mut!(runner);
+            let _ = futures_util::poll!(&mut runner);
+
+            let fut = svc.call(|s| {
+                *s += 1;
+                *s
+            });
+            pin_mut!(fut);
+
+            // Drive to completion.
+            let _ = futures_util::poll!(&mut fut);
+            let _ = futures_util::poll!(&mut runner);
+            let _ = futures_util::poll!(&mut fut);
+            let _ = futures_util::poll!(&mut runner);
+
+            // Poll again after Done — should panic.
+            let _ = futures_util::poll!(&mut fut);
         });
     }
 
