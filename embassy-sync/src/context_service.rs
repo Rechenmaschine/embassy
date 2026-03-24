@@ -39,13 +39,45 @@ unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &JobStorag
     }
 }
 
-// The core problem: async callers want to run FnOnce(&mut T) -> R on a
-// shared T, but T is owned by a single runner task. Each call can have
-// different F and R types, so we need to pass closures and results
-// through a single, non-generic communication channel.
+// For various reasons, one might want to defer code from an async context
+// to a blocking context
 //
-// We solve this with a fixed-size byte buffer ("slot") that both sides
-// read and write and that is coordinated by a handshake protocol.
+// We would like to enable async callers to run FnOnce(&mut T) -> R on a shared
+// T, where T is owned by a single runner task. The interface should remain simple,
+// with a call() function to submit a closure and a run() function to drive execution.
+//
+// ## Design requirements
+// Ideally, each call should be able to have different F and R types. Since the
+// runner task will be unwaare of the exact F and R, we will need to erase the type
+// of the closure and its return value.
+//
+// Like the existing primitives in embassy-sync, both call() and run()
+// should be cancel-safe: dropping either future at any await point must
+// leave the service in a consistent state and ready for further use.
+//
+// Particularly, when a call future is dropped, either:
+//   - the closure was not yet submitted and is simply dropped, or
+//   - the closure was already submitted and will be executed by the
+//     runner to completion (the result is discarded).
+// In both cases, the service remains usable and applies backpressure
+// correctly: new callers are simply blocked until the slot is free.
+//
+// Since run() can also be cancelled, it would be reasonable for it to also be
+// be restartable, that is, a new run() call must be able to pick up where the
+// previous one left off, recovering any in-flight state before accepting new work.
+//
+// ## Implementation
+// Fundamentally, we need some shared memory between the caller and the runner for the
+// closure (and its captured environment) and the return value.
+//
+// Stack-pinned memory on the caller side is not an option since after
+// submission, the runner may still be reading F or writing R when the
+// caller is dropped. We cannot block in Drop to wait for it to finish,
+// and also cannot interrupt the runner mid-execution either.
+//
+// Instead of living on the stack, our closure and result will live in a shared
+// fixed-size byte buffer ("slot"), owned by the ContextService with access
+// coordinated by a handshake protocol.
 //
 // Type erasure:
 //   The slot (JobStorage<S>) is an S-byte buffer. The caller writes its
@@ -84,16 +116,10 @@ unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &JobStorag
 //   - caller owns the slot between receiving done and signalling ack
 //   - runner owns the slot between receiving ack and releasing the permit
 //
-// Design requirements:
-//   Both call() and run() must be cancel-safe: dropping either future at
-//   any await point must leave the service in a consistent state. A
-//   dropped call() before submission does nothing. A dropped call() after
-//   submission lets the runner finish the closure, but the result is
-//   discarded. Since run() can be cancelled, it should also be
-//   restartable: a new run() call picks up where the previous one left
-//   off. This requires considerations for recovering inconsistent state.
+// To support cancellation and restartability, the handshake is extended
+// with a few atomic flags:
 //
-// The full handshake is extended a few atomic flags:
+// The full handshake with recovery flags:
 //
 //   caller                          runner
 //     |                               |
