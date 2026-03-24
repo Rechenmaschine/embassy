@@ -657,13 +657,12 @@ mod tests {
 
     use super::*;
     use crate::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
-    use futures_executor::block_on;
     use core::pin::pin;
 
     /// Run `caller` against `runner` until the caller completes.
     async fn drive<R, N>(caller: impl Future<Output = R>, runner: impl Future<Output = N>) -> R {
-        let mut caller = pin!(caller);
-        let mut runner = pin!(runner);
+        let caller = pin!(caller);
+        let runner = pin!(runner);
         match futures_util::future::select(caller, runner).await {
             futures_util::future::Either::Left((r, _)) => r,
             futures_util::future::Either::Right(_) => unreachable!(),
@@ -840,14 +839,14 @@ mod tests {
     async fn cancel_after_submit_no_leak() {
         let drop_count = Arc::new(AtomicUsize::new(0));
 
-        struct Heavy(Arc<AtomicUsize>, #[allow(dead_code)] [u8; 64]);
+        struct Heavy(Arc<AtomicUsize>, #[allow(dead_code)] [u8; 4096]);
         impl Drop for Heavy {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let svc: ContextService<NoopRawMutex, (), 128> = ContextService::new();
+        let svc: ContextService<NoopRawMutex, (), 4160> = ContextService::new();
         let mut state = ();
 
         let runner = svc.run(&mut state);
@@ -856,7 +855,7 @@ mod tests {
 
         {
             let dc = drop_count.clone();
-            let fut = svc.call(move |_| Heavy(dc, [0xAB; 64]));
+            let fut = svc.call(move |_| Heavy(dc, [0xAB; 4096]));
             let mut fut = pin!(fut);
             let _ = futures_util::poll!(fut.as_mut());
             let _ = futures_util::poll!(runner.as_mut());
@@ -895,16 +894,18 @@ mod tests {
 
             let _ = futures_util::poll!(runner.as_mut());
             let _ = futures_util::poll!(runner.as_mut());
+
+            assert_eq!(drive(svc.call(|_| 42u32), runner).await, 42);
         }
 
         assert_eq!(state, 1);
     }
 
-    /// R's destructor panics during cleanup after caller was dropped.
-    /// FinishGuard should recover the service.
     #[test]
     #[cfg(feature = "std")]
     fn destructor_panic_recovery() {
+        // Destructor of return value panics during cleanup after caller was dropped.
+        // FinishGuard should recover the service
         extern crate std;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -919,7 +920,7 @@ mod tests {
         let mut state = ();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            block_on(async {
+            futures_executor::block_on(async {
                 let runner = svc.run(&mut state);
                 let mut runner = pin!(runner);
                 let _ = futures_util::poll!(runner.as_mut());
@@ -936,16 +937,16 @@ mod tests {
         }));
         assert!(result.is_err(), "destructor should have panicked");
 
-        block_on(async {
+        futures_executor::block_on(async {
             assert_eq!(drive(svc.call(|_| 42u32), svc.run(&mut state)).await, 42);
         });
     }
 
-    /// Closure panics during execution. Caller is dropped during unwind
-    /// (sending ack), next runner recovers.
     #[test]
     #[cfg(feature = "std")]
     fn closure_panic_recovery() {
+        // The closure panics during execution. Caller is dropped during
+        // unwind, should send ack, and the service recovers
         extern crate std;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -953,7 +954,7 @@ mod tests {
         let mut state = 0i32;
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            block_on(async {
+            futures_executor::block_on(async {
                 let fut = svc.call(|_: &mut i32| -> i32 { panic!("closure panic") });
                 let mut fut = pin!(fut);
 
@@ -966,7 +967,7 @@ mod tests {
         }));
         assert!(result.is_err(), "closure should have panicked");
 
-        block_on(async {
+        futures_executor::block_on(async {
             assert_eq!(drive(svc.call(add(1)), svc.run(&mut state)).await, 1);
         });
     }
@@ -991,10 +992,10 @@ mod tests {
         let _ = futures_util::poll!(fut.as_mut()); // poll after Done
     }
 
-    /// Runner dropped with a pending job in the slot.
-    /// New runner must process it, not mark the slot free.
     #[futures_test::test]
     async fn restart_with_pending_job() {
+        // Runner is dropped with a pending job in the slot. The
+        // new runner should process it and not mark the slot free.
         let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
 
