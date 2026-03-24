@@ -197,6 +197,7 @@ pub struct ContextService<M: RawMutex, T, const S: usize> {
 }
 
 impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
+    /// Create a new `ContextService`.
     pub const fn new() -> Self {
         Self {
             slot: JobStorage::new(),
@@ -606,7 +607,7 @@ mod tests {
 
     #[futures_test::test]
     async fn basic() {
-        let svc: ContextService<NoopRawMutex, i32, 2> = ContextService::new();
+        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
         let mut state = 0i32;
         let caller = async {
             svc.call(|s| {

@@ -679,11 +679,11 @@ mod tests {
     #[futures_test::test]
     async fn different_return_types() {
         let svc: ContextService<NoopRawMutex, Vec<String>, 256> = ContextService::new();
-        let mut state = Vec::new();
+        let mut state = Vec::from([String::from("hello")]);
         let caller = async {
-            svc.call(|s| s.push("hello".into())).await;
             assert_eq!(svc.call(|s| s.len()).await, 1);
-            assert_eq!(svc.call(|s| s.join(", ")).await, "hello");
+            svc.call(|s| s.push("world".into())).await;
+            assert_eq!(svc.call(|s| s.join(" ")).await, "hello world");
         };
         let runner = svc.run(&mut state);
         pin_mut!(caller);
