@@ -257,7 +257,6 @@ impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
     unsafe fn submit<R, F: FnOnce(&mut T) -> R>(self, f: F) {
         let slot = self.slot;
         mem::forget(self);
-        slot.debug_assert_held();
         unsafe { slot.storage.store(f) };
         slot.job.signal(run_job::<T, R, F, S>);
     }
@@ -270,7 +269,6 @@ impl<'a, M: RawMutex, T, const S: usize> SlotGuard<'a, M, T, S> {
     unsafe fn submit_immediate<F: FnOnce(&mut T)>(self, f: F) {
         let slot = self.slot;
         mem::forget(self);
-        slot.debug_assert_held();
         unsafe { slot.storage.store(f) };
         slot.ack.signal(());
         slot.job.signal(run_job::<T, (), F, S>);
@@ -344,13 +342,6 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    /// Wait for a caller to submit a job. Returns a `ReceivedJob` that
-    /// must be consumed via `execute_and_signal`.
-    async fn wait_job(&self) -> ReceivedJob<'_, M, T, S> {
-        let run_fn = self.job.wait().await;
-        ReceivedJob { slot: self, run_fn }
-    }
-
     /// Wait for the caller's ack, then clean up the slot and mark it free.
     async fn wait_ack_and_finish(&self) {
         self.ack.wait().await;
@@ -359,24 +350,6 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         unsafe { self.storage.drop_contents() };
         self.done.reset();
         self.mark_free();
-    }
-}
-
-/// A job received from a caller, ready to execute. Produced by
-/// `JobSlot::wait_job`, consumed by `execute_and_signal`.
-struct ReceivedJob<'a, M: RawMutex, T, const S: usize> {
-    slot: &'a JobSlot<M, T, S>,
-    run_fn: RunFn<T, S>,
-}
-
-impl<M: RawMutex, T, const S: usize> ReceivedJob<'_, M, T, S> {
-    /// Execute the closure with `state` and signal the caller that
-    /// the result is ready.
-    fn execute_and_signal(self, state: &mut T) {
-        // Safety: wait_job only returns after a caller stored a live F
-        // matching run_fn. No other task can access the slot.
-        unsafe { (self.run_fn)(&self.slot.storage, state) };
-        self.slot.done.signal(());
     }
 }
 
@@ -520,13 +493,15 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         loop {
             // Wait for a caller to submit a closure.
             // This is a clean cancellation point: no job is in flight.
-            let job = self.slot.wait_job().await;
+            let run_fn = self.slot.job.wait().await;
 
             // Mark in-flight so a subsequent run() knows to recover.
             self.needs_recovery.store(true, Ordering::Release);
 
-            // Execute the closure and tell the caller the result is ready.
-            job.execute_and_signal(state);
+            // Safety: slot contains a live F, run_fn matches its types.
+            // No other task can access the slot: the caller is waiting on done.
+            unsafe { run_fn(&self.slot.storage, state) };
+            self.slot.done.signal(());
 
             // Wait for the caller to read R and signal ack (or for
             // CallFuture::drop to signal ack on cancellation), then
