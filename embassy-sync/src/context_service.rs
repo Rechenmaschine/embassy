@@ -108,9 +108,14 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 ///
 /// To support cancellation and restartabilty of run(), we can extend the above
 /// with a few atomic flags:
-///    - running
-///    - needs_recovery
-///    - initialized
+///   - `running`: prevents concurrent `run()` calls. Cleared by
+///     a drop guard so a new `run()` can start after the old one is dropped.
+///   - `initialized`: ensures the slot is marked free exactly
+///     once across all `run()` calls. Prevents reopening a slot occupied by a
+///     stale call on restart.
+///   - `needs_recovery`: set while a job is in-flight. If the
+///     runner task is dropped while this is true, the next `run()` waits for
+///     the caller's ack and cleans up before accepting new work.
 ///
 /// ```text
 ///   caller                          runner
@@ -137,19 +142,20 @@ type RunFn<T, const S: usize> = unsafe fn(&Storage<S>, &mut T);
 /// needs_recovery, waits for the caller's ack, and cleans up before
 /// entering the main loop.
 ///
-/// running (AtomicBool): prevents concurrent runners. This is cleared by a
-/// drop guard so a new run() can start after the old one is dropped.
-///
 /// The key invariant is that **every job signal is eventually followed by an
 /// ack signal**, provided the caller is eventually dropped. CallFuture::drop
 /// sends ack if the closure was already submitted. This guarantees the
 /// runner (or the next runner, after recovery) can always make progress.
 ///
-/// Closures must not unwind. Under panic=unwind, a panic in f(state) leaves
-/// needs_recovery set and done unsignaled. The caller blocks until it is
-/// dropped, at which point its Drop sends ack and the next runner can
-/// recover. This provides best-effort recovery after drop, not continued
-/// liveness — if the caller is never dropped, the service is wedged.
+/// Closures and return types should avoid unwinding. If `f(state)` panics,
+/// `needs_recovery` will stay set and `done` is never signaled. The caller blocks
+/// until dropped, at which point its Drop sends ack and the next `run()` can
+/// recover. This provides us with recovery after drop, but there is no liveness
+/// guarantee. That is, if the caller is never dropped, the service becomes blocked. If
+/// `R`'s destructor panics during cleanup, the `FinishGuard` in `wait_ack_and_finish`
+/// ensures the slot is still freed and `needs_recovery` is cleared. The destructor's
+/// side effects are lost but the service remains usable.
+// TODO: this could probably be circumvented, but is is worth it... :doubt:
 
 struct SlotState {
     free: bool,
@@ -171,7 +177,7 @@ impl SlotState {
 /// - `take<T>()` reads a `T` out and clears `drop_fn`
 /// - `drop_contents()` drops in place if occupied; no-op if empty
 #[repr(C, align(8))]
-//TODO: is 8 aligned ok?
+//TODO: unflexible, but need to choose some value... maybe target_pointer_width is better?
 struct Storage<const S: usize> {
     buf: UnsafeCell<MaybeUninit<[u8; S]>>,
     drop_fn: UnsafeCell<Option<unsafe fn(&Self)>>,
@@ -191,7 +197,7 @@ impl<const S: usize> Storage<S> {
         // SAFETY: caller guarantees the slot is empty and T fits.
         unsafe {
             (*self.buf.get()).as_mut_ptr().cast::<T>().write(val);
-            *self.drop_fn.get() = Some(Self::drop_glue::<T>);
+            *self.drop_fn.get() = Some(Self::drop_typed::<T>);
         }
     }
 
@@ -211,8 +217,7 @@ impl<const S: usize> Storage<S> {
     ///
     /// # Panic behavior
     /// If the stored value's destructor panics, `drop_fn` is already
-    /// cleared so double-drop will not occur. The buffer bytes remain
-    /// and are overwritten by the next `store()`.
+    /// cleared so double-drop won't occur
     unsafe fn drop_contents(&self) {
         // SAFETY: caller guarantees exclusive access.
         unsafe {
@@ -224,7 +229,7 @@ impl<const S: usize> Storage<S> {
 
     /// # Safety
     /// `slot` must currently contain a live `T`.
-    unsafe fn drop_glue<T>(slot: &Self) {
+    unsafe fn drop_typed<T>(slot: &Self) {
         // SAFETY: caller guarantees the slot contains a live T.
         unsafe {
             core::ptr::drop_in_place((*slot.buf.get()).as_mut_ptr().cast::<T>());
@@ -247,9 +252,7 @@ impl<const S: usize> Drop for Storage<S> {
 ///
 /// # Panic behavior
 /// If `f(state)` panics, `F` has already been taken from the slot and `R` is
-/// never stored. The slot is left empty (`drop_fn` is `None`). Under unwinding,
-/// the caller waiting on `done` will block until dropped.
-// TODO check panic behaviour in more detail
+/// never stored. The slot is left empty (`drop_fn` is `None`).
 unsafe fn run_job<T, R, F: FnOnce(&mut T) -> R, const S: usize>(slot: &Storage<S>, state: &mut T) {
     // SAFETY: caller guarantees slot contains a live F and R fits.
     unsafe {
@@ -278,8 +281,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    // TODO: documentation needed
-
+    // TODO: should remove this or make debug_assert message clearer.
     fn debug_assert_held(&self) {
         self.state.lock(|cell| {
             let s = cell.replace(SlotState::EMPTY);
@@ -288,6 +290,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         });
     }
 
+    // TODO: documentation needed
     fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
@@ -303,6 +306,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         })
     }
 
+    // TODO: documentation needed
     fn try_acquire(&self) -> bool {
         self.state.lock(|cell| {
             let mut s = cell.replace(SlotState::EMPTY);
@@ -362,17 +366,12 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
         }
     }
 
-    // TODO: make docs more concise, and check correctness.
+    // TODO: maybe more docs
     /// Wait for the caller's ack, then clean up the slot and mark it free.
     ///
     /// If the stored value's destructor panics under unwinding, the slot
-    /// is still reset and freed. The destructor's side effects are lost
-    /// but the buffer is reused by the next job; no double-drop occurs.
+    /// is still reset and freed.
     async fn wait_ack_and_finish(&self, needs_recovery: &AtomicBool) {
-        // Drop guard ensures done.reset(), mark_free(), and needs_recovery
-        // cleanup run even if drop_contents() panics. Same pattern as
-        // multi_waker's set_len(0)-before-wake: if the destructor panics,
-        // its side effects are lost but the service remains usable.
         struct FinishGuard<'a, M: RawMutex, T, const S: usize> {
             slot: &'a JobSlot<M, T, S>,
             needs_recovery: &'a AtomicBool,
@@ -393,8 +392,7 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
             needs_recovery,
         };
         // SAFETY: ack received, so the caller is done with the slot.
-        // drop_contents clears drop_fn before calling the destructor,
-        // so a panic here won't cause double-drop.
+        // drop_contents() already guards against double drop.
         unsafe { self.storage.drop_contents() };
     }
 }
@@ -447,15 +445,20 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         }
     }
 
-    /// Submit a closure for execution on the runner and await the result.
+    /// Submit a closure for execution on the runner.
     ///
     /// Fails at compile time if `F` or `R` exceeds the slot capacity `S`.
     ///
+    /// **Note:** Under panic=unwind, a panicking closure prevents the returned
+    /// future from ever completing.
+    ///
+    /// ## Cancellation
+    ///
     /// The returned future is cancel-safe: dropping it at any point is
     /// sound and leaves the service in a usable state. If dropped before
-    /// the closure has been submitted to the runner, no work is performed.
-    /// If dropped after submission, the runner will execute the closure to
-    /// completion and the return value is discarded.
+    /// the closure has been submitted, no work is performed. If dropped
+    /// after submission, the closure will still be executed to completion
+    /// and the return value is discarded.
     pub fn call<R, F>(&self, f: F) -> CallFuture<'_, M, T, R, F, S>
     where
         F: FnOnce(&mut T) -> R + Send + 'static,
@@ -474,12 +477,9 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     /// Try to submit a fire-and-forget closure without blocking.
     ///
     /// Returns `true` if the closure was submitted, `false` if the slot is busy.
-    /// The closure will be executed by the runner; there is no way to retrieve
-    /// a return value.
-    ///
-    /// A successful submission does not guarantee a runner is currently active.
-    /// If no runner is running, the closure will remain pending until the next
-    /// call to [`run()`](Self::run).
+    /// A submitted closure will be executed during the next [`run()`](Self::run)
+    /// call. If no `run()` is currently active, it remains pending until one
+    /// starts. There is no way to retrieve a return value.
     pub fn try_call_immediate<F>(&self, f: F) -> bool
     where
         F: FnOnce(&mut T) + Send + 'static,
@@ -496,18 +496,19 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     }
 
     /// Run the service loop, executing closures submitted via [`call`](Self::call)
-    /// with exclusive `&mut T` access.
+    /// with exclusive `&mut T` access. This future must be polled (f.ex spawned as
+    /// a task) for callers to make progress.
     ///
     /// # Panics
     ///
-    /// Panics if called while another runner is still active.
-    /// Sequential calls after a previous runner was dropped are fine.
+    /// Panics if called while another `run()` is still active.
+    /// Sequential calls after a previous `run()` was dropped are fine.
     ///
     /// # Cancellation
     ///
-    /// This future is cancel-safe. A subsequent call to `run()` will recover any
-    /// in-flight state and resume processing. Callers that were blocked will
-    /// transparently continue once the new runner starts.
+    /// This future is cancel-safe. A subsequent call to `run()` will recover the
+    /// previous state and resume processing any in-flight call. Callers that were
+    /// blocked will transparently continue once the new `run()` starts.
     pub async fn run(&self, state: &mut T) -> ! {
         struct RunGuard<'a> {
             running: &'a AtomicBool,
@@ -523,33 +524,33 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         }
         let _guard = RunGuard { running: &self.running };
 
-        // If the previous runner was cancelled mid-job, the caller may still
-        // be interacting with the slot. Wait for it to finish (the caller
-        // always acks, either explicitly or via its Drop), then clean up.
+        // If the previous runner was cancelled mid-job the caller might still
+        // be interacting with the slot. We must wait for it to finish (the caller
+        // always acks, either explicitly or via its Drop) and then clean up.
         if self.needs_recovery.load(Ordering::Acquire) {
             self.slot.wait_ack_and_finish(&self.needs_recovery).await;
         }
 
-        // Mark the slot as free exactly once across all run() calls.
-        // On restarts without recovery, the slot is either already free
-        // (previous finish freed it) or contains a pending job that
-        // the runner will pick up via wait_job below.
+        // Only the first run() may open the slot. On restarts, the slot
+        // is either already free or holds a pending job from a caller
+        // that submitted while no run() was active, which we may not clear!
         if !self.initialized.swap(true, Ordering::Relaxed) {
             self.slot.mark_free();
         }
 
         loop {
             // Wait for a caller to submit a closure.
-            // This is a clean cancellation point: no job is in flight.
+            // This is a clean cancellation point because no job in flight
             let run_fn = self.slot.job.wait().await;
 
-            // Mark in-flight so a subsequent run() knows to recover.
+            // From here on we may need to recover if cancellation occurs
             self.needs_recovery.store(true, Ordering::Release);
 
             // SAFETY: slot contains a live F, run_fn matches its types.
-            // No other task can access the slot: the caller is waiting on done.
-            // Note: if the closure panics under unwinding, done is never signaled.
-            // The caller blocks until dropped, then ack allows recovery.
+            // No other task can access the slot, because the caller is waiting on done.
+            // If the closure panics under unwinding, done is not signaled. The
+            // caller would then block until dropped, but dropping sends an ack
+            // and then allows for run to make progress.
             unsafe { run_fn(&self.slot.storage, state) };
             self.slot.done.signal(());
 
@@ -563,8 +564,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     }
 }
 
-// SAFETY: access to Storage is serialized by the call/run handshake protocol.
-// The remaining fields (signals, mutex, atomics) are Sync on their own.
+// SAFETY: access to Storage is serialized by the call/run handshake protocol
 unsafe impl<M: RawMutex, T, const S: usize> Sync for ContextService<M, T, S>
 where
     Mutex<M, Cell<SlotState>>: Sync,
@@ -601,7 +601,7 @@ where
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(()) => {
                         let f = self.f.take().unwrap();
-                        // SAFETY: we just acquired the slot, F and R fit (compile-time check in call()).
+                        // SAFETY: we just acquired the slot, F and R fit (compile-time check in call())
                         unsafe { self.svc.slot.submit::<R, F>(f) };
                         self.phase = Phase::Submitted;
                     }
