@@ -212,9 +212,9 @@ impl<const S: usize> Storage<S> {
     /// Caller must have exclusive access.
     ///
     /// # Panics
-    /// If the stored value's destructor panics, the slot is left in an
-    /// unspecified state. The `drop_fn` is already cleared, so double-drop
-    /// will not occur on the next call to `drop_contents`.
+    /// If the stored value's destructor panics, `drop_fn` is already
+    /// cleared so double-drop will not occur. The buffer bytes remain
+    /// and are overwritten by the next `store()`.
     unsafe fn drop_contents(&self) {
         // SAFETY: caller guarantees exclusive access.
         unsafe {
@@ -357,13 +357,38 @@ impl<M: RawMutex, T, const S: usize> JobSlot<M, T, S> {
     }
 
     /// Wait for the caller's ack, then clean up the slot and mark it free.
-    async fn wait_ack_and_finish(&self) {
+    ///
+    /// If the stored value's destructor panics under unwinding, the slot
+    /// is still reset and freed. The destructor's side effects are lost
+    /// but the buffer is reused by the next job; no double-drop occurs.
+    async fn wait_ack_and_finish(&self, needs_recovery: &AtomicBool) {
+        // Drop guard ensures done.reset(), mark_free(), and needs_recovery
+        // cleanup run even if drop_contents() panics. Same pattern as
+        // multi_waker's set_len(0)-before-wake: if the destructor panics,
+        // its side effects are lost but the service remains usable.
+        struct FinishGuard<'a, M: RawMutex, T, const S: usize> {
+            slot: &'a JobSlot<M, T, S>,
+            needs_recovery: &'a AtomicBool,
+        }
+        impl<M: RawMutex, T, const S: usize> Drop for FinishGuard<'_, M, T, S> {
+            fn drop(&mut self) {
+                self.needs_recovery.store(false, Ordering::Release);
+                self.slot.done.reset();
+                self.slot.mark_free();
+            }
+        }
+
         self.ack.wait().await;
         self.debug_assert_held();
+
+        let _guard = FinishGuard {
+            slot: self,
+            needs_recovery,
+        };
         // SAFETY: ack received, so the caller is done with the slot.
+        // drop_contents clears drop_fn before calling the destructor,
+        // so a panic here won't cause double-drop.
         unsafe { self.storage.drop_contents() };
-        self.done.reset();
-        self.mark_free();
     }
 }
 
@@ -492,8 +517,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
         // be interacting with the slot. Wait for it to finish (the caller
         // always acks, either explicitly or via its Drop), then clean up.
         if self.needs_recovery.load(Ordering::Acquire) {
-            self.slot.wait_ack_and_finish().await;
-            self.needs_recovery.store(false, Ordering::Release);
+            self.slot.wait_ack_and_finish(&self.needs_recovery).await;
         }
 
         // Mark the slot as free exactly once across all run() calls.
@@ -524,8 +548,7 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
             // clean up the slot and mark it free for the next caller.
             // If cancelled here, needs_recovery is true and the next
             // run() will wait for ack before touching the slot.
-            self.slot.wait_ack_and_finish().await;
-            self.needs_recovery.store(false, Ordering::Release);
+            self.slot.wait_ack_and_finish(&self.needs_recovery).await;
         }
     }
 }
@@ -1054,6 +1077,114 @@ mod tests {
         }
 
         assert_eq!(state, 1);
+    }
+
+    /// Test that if the returned value's destructor panics during cleanup
+    /// (caller dropped after submission, runner drops R), the FinishGuard
+    /// recovers the service: slot is freed, needs_recovery is cleared,
+    /// and subsequent calls work.
+    #[test]
+    #[cfg(feature = "std")]
+    fn destructor_panic_recovery() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("destructor panic");
+            }
+        }
+
+        let svc: ContextService<NoopRawMutex, (), 64> = ContextService::new();
+        let mut state = ();
+
+        // Start the runner, submit a job that returns PanicOnDrop,
+        // then drop the caller so the runner has to clean up R.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            block_on(async {
+                let runner = svc.run(&mut state);
+                pin_mut!(runner);
+                let _ = futures_util::poll!(&mut runner);
+
+                {
+                    let fut = svc.call(|_| PanicOnDrop);
+                    pin_mut!(fut);
+                    let _ = futures_util::poll!(&mut fut);
+                    let _ = futures_util::poll!(&mut runner);
+                    // Drop caller: signals ack without taking R.
+                }
+
+                // Runner receives ack, calls drop_contents() which panics.
+                let _ = futures_util::poll!(&mut runner);
+            });
+        }));
+        assert!(result.is_err(), "expected panic from destructor");
+
+        // Service should be usable again.
+        block_on(async {
+            let runner = svc.run(&mut state);
+            pin_mut!(runner);
+            let caller = async { svc.call(|_| 42u32).await };
+            pin_mut!(caller);
+            match futures_util::future::select(caller, runner).await {
+                futures_util::future::Either::Left((r, _)) => assert_eq!(r, 42),
+                _ => panic!("expected caller to complete"),
+            }
+        });
+    }
+
+    /// Test that if the closure panics under unwinding, the caller is
+    /// stuck until dropped, after which the next runner recovers.
+    #[test]
+    #[cfg(feature = "std")]
+    fn closure_panic_recovery() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let svc: ContextService<NoopRawMutex, i32, 64> = ContextService::new();
+        let mut state = 0i32;
+
+        // Start runner, submit a panicking closure.
+        // The runner will panic during execution.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            block_on(async {
+                let fut = svc.call(|_: &mut i32| -> i32 { panic!("closure panic") });
+                pin_mut!(fut);
+
+                let runner = svc.run(&mut state);
+                pin_mut!(runner);
+                // Runner initializes.
+                let _ = futures_util::poll!(&mut runner);
+                // Caller submits.
+                let _ = futures_util::poll!(&mut fut);
+                // Runner executes — closure panics.
+                let _ = futures_util::poll!(&mut runner);
+            });
+        }));
+        assert!(result.is_err(), "expected panic from closure");
+
+        // The caller future was inside the catch_unwind and was dropped
+        // during unwinding. Its Drop sent ack (phase was Submitted).
+
+        // Service should recover: needs_recovery is true, next runner
+        // waits for ack (already sent by Drop), cleans up, works again.
+        block_on(async {
+            let runner = svc.run(&mut state);
+            pin_mut!(runner);
+            let caller = async {
+                svc.call(|s| {
+                    *s += 1;
+                    *s
+                })
+                .await
+            };
+            pin_mut!(caller);
+            match futures_util::future::select(caller, runner).await {
+                futures_util::future::Either::Left((r, _)) => assert_eq!(r, 1),
+                _ => panic!("expected caller to complete"),
+            }
+        });
     }
 
     /// Regression test: runner dropped with a pending job in the slot.
