@@ -476,6 +476,10 @@ impl<M: RawMutex, T, const S: usize> ContextService<M, T, S> {
     /// Returns `true` if the closure was submitted, `false` if the slot is busy.
     /// The closure will be executed by the runner; there is no way to retrieve
     /// a return value.
+    ///
+    /// A successful submission does not guarantee a runner is currently active.
+    /// If no runner is running, the closure will remain pending until the next
+    /// call to [`run()`](Self::run).
     pub fn try_call_immediate<F>(&self, f: F) -> bool
     where
         F: FnOnce(&mut T) + Send + 'static,
