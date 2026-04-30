@@ -24,6 +24,12 @@ use crate::blocking_mutex::Mutex;
 use crate::blocking_mutex::raw::RawMutex;
 use crate::waitqueue::WakerRegistration;
 
+/// Error returned by [`Sender::try_clear`] / [`Receiver::try_clear`]
+/// when the peer endpoint still holds an outstanding slot.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TryClearError;
+
 /// A bounded zero-copy channel for communicating between asynchronous tasks
 /// with backpressure.
 ///
@@ -59,6 +65,8 @@ impl<'a, M: RawMutex, T> Channel<'a, M, T> {
                 front: 0,
                 back: 0,
                 full: false,
+                outstanding_send: false,
+                outstanding_receive: false,
                 send_waker: WakerRegistration::new(),
                 receive_waker: WakerRegistration::new(),
             })),
@@ -171,6 +179,20 @@ impl<'a, M: RawMutex, T> Sender<'a, M, T> {
         })
     }
 
+    /// Clears all elements in the channel.
+    ///
+    /// Fails if the peer [`Receiver`] still holds a [`ReceiveSlot`].
+    pub fn try_clear(&mut self) -> Result<(), TryClearError> {
+        self.channel.state.lock(|s| {
+            let s = &mut *s.borrow_mut();
+            if s.outstanding_receive {
+                return Err(TryClearError);
+            }
+            s.clear();
+            Ok(())
+        })
+    }
+
     /// Returns the number of elements currently in the channel.
     pub fn len(&self) -> usize {
         self.channel.state.lock(|s| s.borrow().len())
@@ -213,6 +235,12 @@ impl<M: RawMutex, T> SendSlot<'_, M, T> {
     /// Notify the channel that the sending of the value has been finalized.
     pub fn send_done(self) {
         self.state.lock(|s| s.borrow_mut().push_done());
+    }
+}
+
+impl<M: RawMutex, T> Drop for SendSlot<'_, M, T> {
+    fn drop(&mut self) {
+        self.state.lock(|s| s.borrow_mut().outstanding_send = false);
     }
 }
 
@@ -278,6 +306,20 @@ impl<'a, M: RawMutex, T> Receiver<'a, M, T> {
         })
     }
 
+    /// Clears all elements in the channel.
+    ///
+    /// Fails if the peer [`Sender`] still holds a [`SendSlot`].
+    pub fn try_clear(&mut self) -> Result<(), TryClearError> {
+        self.channel.state.lock(|s| {
+            let s = &mut *s.borrow_mut();
+            if s.outstanding_send {
+                return Err(TryClearError);
+            }
+            s.clear();
+            Ok(())
+        })
+    }
+
     /// Returns the number of elements currently in the channel.
     pub fn len(&self) -> usize {
         self.channel.state.lock(|s| s.borrow().len())
@@ -323,6 +365,12 @@ impl<M: RawMutex, T> ReceiveSlot<'_, M, T> {
     }
 }
 
+impl<M: RawMutex, T> Drop for ReceiveSlot<'_, M, T> {
+    fn drop(&mut self) {
+        self.state.lock(|s| s.borrow_mut().outstanding_receive = false);
+    }
+}
+
 #[derive(Debug)]
 struct State {
     /// Maximum number of elements the channel can hold.
@@ -336,6 +384,10 @@ struct State {
     /// Used to distinguish "empty" and "full" cases when `front == back`.
     /// May only be `true` if `front == back`, always `false` otherwise.
     full: bool,
+
+    /// True while a `SendSlot`/`ReceiveSlot` is alive. Used by `try_clear`.
+    outstanding_send: bool,
+    outstanding_receive: bool,
 
     send_waker: WakerRegistration,
     receive_waker: WakerRegistration,
@@ -378,7 +430,10 @@ impl State {
     fn push_index(&mut self) -> Option<usize> {
         match self.is_full() {
             true => None,
-            false => Some(self.back),
+            false => {
+                self.outstanding_send = true;
+                Some(self.back)
+            }
         }
     }
 
@@ -393,7 +448,10 @@ impl State {
     fn pop_index(&mut self) -> Option<usize> {
         match self.is_empty() {
             true => None,
-            false => Some(self.front),
+            false => {
+                self.outstanding_receive = true;
+                Some(self.front)
+            }
         }
     }
 
@@ -401,5 +459,31 @@ impl State {
         self.front = self.increment(self.front);
         self.full = false;
         self.receive_waker.wake();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocking_mutex::raw::NoopRawMutex;
+
+    #[test]
+    fn try_clear_refuses_while_peer_slot_alive() {
+        let mut buf = [0u32; 2];
+        let mut ch = Channel::<NoopRawMutex, u32>::new(&mut buf);
+        let (mut tx, mut rx) = ch.split();
+
+        let send_slot = tx.try_send().unwrap();
+        assert_eq!(rx.try_clear(), Err(TryClearError));
+        drop(send_slot);
+        rx.try_clear().unwrap();
+
+        tx.try_send().unwrap().send_done();
+        let recv_slot = rx.try_receive().unwrap();
+        assert_eq!(tx.try_clear(), Err(TryClearError));
+        drop(recv_slot);
+        tx.try_clear().unwrap();
+
+        assert!(tx.is_empty());
     }
 }
